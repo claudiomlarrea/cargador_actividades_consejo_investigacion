@@ -110,7 +110,7 @@ def classify_topic(text: str) -> str:
     return "Proyectos de investigación"  # fallback
 
 # ──────────────────────────────────────────
-# EXTRACCIÓN / FILTROS DE ITEMS
+# FILTROS / EXTRACTORES DE TÍTULO
 # ──────────────────────────────────────────
 NARRATIVE_STARTS = (
     r"^se\s", r"^los\s+informes", r"^las\s+categor[ií]as", r"^fueron\s+consultadas",
@@ -125,10 +125,9 @@ def is_narrative(item: str) -> bool:
     for pat in NARRATIVE_STARTS:
         if re.search(pat, t):
             return True
-    # si no contiene rastro de “proyecto/projovi/título/director”, es probable que sea narrativo
+    # si no hay pistas de proyecto, es probable que sea narrativo
     if not re.search(r"(proyecto|projovi|pid|ppi|t[ií]tulo|denominaci[oó]n|director)", t):
-        # pero podría ser un TÍTULO en MAYÚSCULAS (ej. SALUD MENTAL EN ADOLESCENTES…)
-        first_line = t.split("\n", 1)[0]
+        # salvo que parezca un título en mayúsculas
         if not re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", item):
             return True
     return False
@@ -136,67 +135,93 @@ def is_narrative(item: str) -> bool:
 def clean_person_titles(s: str) -> str:
     return re.sub(r"\b(Dr\.?|Dra\.?|Lic\.?|Prof\.?|Mg\.?|Ing\.?)\b\.?\s*", "", s, flags=re.IGNORECASE)
 
+def strip_leading_index(s: str) -> str:
+    return re.sub(r"^\s*\d+\s*[\.\)]\s*", "", s).strip()
+
+BAD_TITLE_PATTERNS = [
+    r"^presentaci[oó]n\s+de\s+informes?", r"^director(?:a)?$", r"^\(?\s*20\d{2}\s*-\s*20\d{2}\s*\)?$",
+    r"^punto\s+\d+$", r"^anexo\b", r"^varios$", r"^informes?\b", r"^acta\b"
+]
+def looks_bad_title(s: str) -> bool:
+    t = norm(s).lower()
+    if len(t) < 4: return True
+    return any(re.search(p, t) for p in BAD_TITLE_PATTERNS)
+
 def extract_title_strict(text: str) -> str:
     """
     Devuelve SOLO el nombre del proyecto/actividad.
-    Reglas:
-      1) Prioriza campos rotulados: Denominación:/Título:/Proyecto:
-      2) Si hay 'Director', toma lo que esté ANTES de 'Director'
-      3) Si no, toma la primera línea que parezca un título (MAYÚSCULAS/Title Case)
-      4) Limpia comillas y frases administrativas
+    Regla: prioriza rótulos; luego PROJOVI/PID/PPI; luego comillas; luego línea 'con pinta de título'.
     """
     t = norm(text)
 
     # 1) rotulados
     m = re.search(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)\s*:\s*(.+)", t, re.IGNORECASE)
     if m:
-        cand = m.group(2)
-        cand = re.split(r"\bDirector(?:a)?\b\s*:", cand, flags=re.IGNORECASE)[0]
-        cand = re.split(r"[;\n]", cand, maxsplit=1)[0]
-        return norm(cand.strip(" .,:;–-\"'«»“”"))
+        cand = re.split(r"\bDirector(?:a)?\b\s*:", m.group(2), flags=re.IGNORECASE)[0]
+        cand = strip_leading_index(cand.split("\n")[0]).strip(" .,:;–-\"'«»“”")
+        return norm(cand)
 
-    # 2) si aparece “Director: …”, tomar lo anterior a esa etiqueta
-    if "Director" in t or "Directora" in t:
-        pre = re.split(r"\bDirector(?:a)?\b\s*:", t, flags=re.IGNORECASE)[0]
-        # suele venir “PROJOVI: TÍTULO …  Director: …”
-        # quedarnos con la última línea no vacía de 'pre'
-        pre_lines = [ln.strip() for ln in pre.split("\n") if ln.strip()]
-        if pre_lines:
-            cand = pre_lines[-1]
-            # si tiene prefijo PROJOVI:/PID:/PPI: conservar tras el colon
-            m2 = re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", cand, re.IGNORECASE)
-            if m2:
-                return norm(m2.group(2).strip(" .,:;–-\"'«»“”"))
-            return norm(cand.strip(" .,:;–-\"'«»“”"))
+    # 2) PROJOVI/PID/PPI
+    m = re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", t, re.IGNORECASE)
+    if m:
+        cand = re.split(r"\bDirector(?:a)?\b\s*:", m.group(2), flags=re.IGNORECASE)[0]
+        return norm(strip_leading_index(cand).strip(" .,:;–-\"'«»“”"))
 
-    # 3) primera línea con pinta de título
-    #    - muchas mayúsculas o Capitalización de palabras
-    first_line = t.split("\n", 1)[0]
-    # si la primera línea es muy larga y tiene verbos típicos (“se aprueba…”) -> descartar
-    if re.match(r"(?i)se\s+|los\s+informes|las\s+categor", first_line):
-        first_line = ""
+    # 3) comillas
+    m = re.search(r"[«“\"']([^\"”»']{6,})[\"”»']", t)
+    if m:
+        return norm(strip_leading_index(m.group(1)))
 
-    if not first_line:
-        # buscar una línea candidata dentro del ítem
-        for ln in t.split("\n"):
-            ln = ln.strip()
-            if len(ln) < 6: 
-                continue
-            if re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", ln, re.IGNORECASE):
-                return norm(re.sub(r"^(PROJOVI|PID|PPI)\s*:\s*", "", ln, flags=re.IGNORECASE))
-            # heurística de TÍTULO: ≥ 60% letras mayúsculas/acentuadas o pocas preposiciones
-            cap_ratio = (sum(1 for c in ln if c.isupper()) / max(1, sum(1 for c in ln if c.isalpha())))
-            if cap_ratio > 0.6 or re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", ln):
-                return norm(ln.strip(" .,:;–-\"'«»“”"))
+    # 4) línea candidata (mayúsculas/Title Case) no administrativa
+    for ln in t.split("\n"):
+        ln = strip_leading_index(ln.strip())
+        if len(ln) < 6:
+            continue
+        if re.match(r"(?i)(se\s+|los\s+informes|las\s+categor|presentaci[oó]n\s+de\s+informes)", ln):
+            continue
+        if re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", ln) or ln.istitle():
+            return norm(ln.strip(" .,:;–-\"'«»“”"))
 
-    # 4) comillas
-    m3 = re.search(r"[«“\"']([^\"”»']{6,})[\"”»']", t)
-    if m3:
-        return norm(m3.group(1).strip(" .,:;–-\"'«»“”"))
-
-    # 5) fallback vacío
     return ""
 
+def extract_title_by_topic(item_text: str, topic: str) -> str:
+    """
+    Ajusta el título según el Tipo_tema:
+      - En Informes de avances/finales: limpiar 'Presentación de informes...' y
+        buscar el NOMBRE DEL PROYECTO al que refiere el informe.
+      - Resto de temas: aplicar extractor estricto.
+    """
+    t = norm(item_text)
+
+    if topic in ("Informes de avances", "Informes finales"):
+        # eliminar rótulos genéricos para no devolverlos como título
+        t = re.sub(r"(?i)^\s*\d+\s*[\.\)]\s*", "", t)
+        t = re.sub(r"(?i)presentaci[oó]n\s+de\s+informes?\s+de\s+(avance|final(?:es)?)\s*[:\-]?\s*", "", t)
+        # buscar campos rotulados o PROJOVI/PID/PPI
+        for rgx in [
+            r"(Denominaci[oó]n|T[ií]tulo|Proyecto)\s*:\s*(.+?)\s*(?:Director(?:a)?\s*:|$|\n)",
+            r"(PROJOVI|PID|PPI)\s*:\s*(.+?)\s*(?:Director(?:a)?\s*:|$|\n)"
+        ]:
+            m = re.search(rgx, t, re.IGNORECASE | re.DOTALL)
+            if m:
+                cand = strip_leading_index(m.group(2))
+                cand = norm(cand.strip(" .,:;–-\"'«»“”"))
+                if cand and not looks_bad_title(cand):
+                    return cand
+        # fallback: heurística general
+        cand = extract_title_strict(t)
+        return "" if looks_bad_title(cand) else cand
+
+    # otros temas
+    cand = extract_title_strict(t)
+    cand = strip_leading_index(cand)
+    if looks_bad_title(cand):
+        return ""
+    return cand
+
+# ──────────────────────────────────────────
+# OTROS CAMPOS
+# ──────────────────────────────────────────
 def find_state(text: str) -> str:
     for label, pat in [
         ("Aprobado y elevado", r"\baprobado(?:s)?\b.*\belevad"),
@@ -255,24 +280,13 @@ def parse_acta_to_rows(text: str, fname: str):
     for fac, chunk in block_by_faculty(text):
         for item in split_items(chunk):
             if is_narrative(item):
-                continue  # descartar bullets narrativos/administrativos
+                continue
             topic = classify_topic(item)
-            title = extract_title_strict(item)
+            title = extract_title_by_topic(item, topic)
             if not title:
-                # último intento: si hay “Director”, toma el tramo anterior, si no, primera oración sin verbos administrativos
-                title = re.split(r"\bDirector(?:a)?\b\s*:", item, flags=re.IGNORECASE)[0]
-                title = title.split(".")[0]
-                title = norm(title)
-            # limpiar conectores si quedó algo
-            title = re.sub(r"^(PROJOVI|PID|PPI)\s*:\s*", "", title, flags=re.IGNORECASE)
-            title = norm(title.strip(" .,:;–-\"'«»“”"))
-
-            if not title:
-                continue  # si no hay título claro, no creamos fila
-
+                continue
             director = find_director(item)
             estado = find_state(item)
-
             rows.append({
                 "Año": infer_year_from_text(fecha, full_text=text),
                 "Acta": acta,
