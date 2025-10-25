@@ -46,8 +46,7 @@ def extract_text_any(uploaded) -> str:
 
 def find_date_header(text: str) -> Tuple[str, str]:
     """
-    Intenta detectar fecha/año de la reunión en el encabezado o nombre.
-    Formatos esperados: 20/02/2025, 21-08-25, 18_04_24, 23/10/2025, etc.
+    Detecta año/fecha de la reunión (cabecera). Acepta 20/02/2025, 21-08-25, 18_04_24, etc.
     """
     head = text[:1200]
     # dd[/-_]mm[/-_]yyyy | dd[/-_]mm[/-_]yy
@@ -67,11 +66,10 @@ def find_date_header(text: str) -> Tuple[str, str]:
         }
         y = mapa.get(unicodedata.normalize("NFKD", m2.group(1)).replace("́","").lower())
         if y:
-            # tomar primera línea larga como "fecha textual"
             for ln in head.split("\n"):
                 if len(ln.strip()) > 12:
                     return str(y), ln.strip()
-    # fallback: primer año 20xx
+    # fallback: primer 20xx
     m3 = re.search(r"\b(20\d{2})\b", head)
     if m3:
         return m3.group(1), ""
@@ -111,20 +109,19 @@ FIXED_COLUMNS = [
     "Publicación",
     "Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)",
     "Docente o investigador incluida en la publicación",
-    "Unidad académica (Publicación)",  # ← desambiguado para mantener unicidad de columnas
+    "Unidad académica (Publicación)",
 
     "Categorización de docentes",
     "Nombre del docente categorizado como investigador",
     "Categoría alcanzada por el docente como docente investigador",
-    "Unidad académica (Categorización)",  # ← desambiguado
+    "Unidad académica (Categorización)",
 
-    # Becarios: unificamos como dos pares (doctoral/postdoctoral)
     "Becario de beca cofinanciada doctoral",
     "Nombre del becario doctoral",
     "Becario de beca cofinanciada postdoctoral",
     "Nombre del becario postdoctoral",
 
-    "OTROS TEMAS"  # todo lo que no encaje arriba
+    "OTROS TEMAS"
 ]
 
 def empty_row(base: Dict[str, Any]=None) -> Dict[str, Any]:
@@ -134,170 +131,201 @@ def empty_row(base: Dict[str, Any]=None) -> Dict[str, Any]:
     return row
 
 # ──────────────────────────────────────────
-# PARSER DE SECCIONES (ÓRDENES DEL DÍA)
+# PARSER ROBUSTO (encabezados y títulos sin rótulo)
 # ──────────────────────────────────────────
-SECTION_MAP = {
-    "proyectos": re.compile(r"^(proyectos? (de )?investigaci[oó]n|presentaci[oó]n de proyectos?)\b", re.I),
-    "avance":    re.compile(r"^informes? de avance\b", re.I),
-    "final":     re.compile(r"^informes? finales?\b", re.I),
-    "catedra":   re.compile(r"(proyectos? (de )?c[aá]tedra|proyectos? cuadernos)", re.I),
-    "publica":   re.compile(r"^publicaci[oó]n|^publicaciones\b", re.I),
+SECTION_HEADERS = {
+    "proyectos": re.compile(r"^(presentaci[oó]n\s+de\s+proyectos?|proyectos?\s+(de\s+)?investigaci[oó]n)\b", re.I),
+    "final":     re.compile(r"^informes?\s+final(?:es)?\b", re.I),
+    "avance":    re.compile(r"^informes?\s+de\s+avance\b", re.I),
+    "catedra":   re.compile(r"(proyectos?\s+(de\s+)?c[aá]tedra|proyectos?\s+cuadernos)", re.I),
+    "publica":   re.compile(r"^publicaci[oó]n(?:es)?\b", re.I),
     "categ":     re.compile(r"^categorizaci[oó]n", re.I),
-    "beca":      re.compile(r"^becari[oa]s?", re.I),
+    "beca":      re.compile(r"^becari[oa]s?\b", re.I),
 }
 
+DIRECTOR_LABELS = re.compile(r"\b(Director(?:a)?|Co[- ]?director(?:a)?)\b\s*:", re.I)
+TEAM_LABELS     = re.compile(r"\b(Equipo\s+(de\s+Trabajo|de\s+Investigaci[oó]n)?|Integrantes|Investigadores|Docentes|Estudiantes)\b\s*:", re.I)
+UNIT_LABELS     = re.compile(r"\b(Facultad|Escuela|Instituto|Vicerrectorado)\b", re.I)
+
 def split_lines(text: str) -> List[str]:
-    lines = [ln.strip(" -•\t") for ln in text.split("\n")]
+    lines = [norm(ln.strip(" \t-•—–")) for ln in text.split("\n")]
     return [ln for ln in lines if ln]
 
-def current_section_of(line: str) -> str:
-    l = line.strip()
-    for key, rx in SECTION_MAP.items():
-        if rx.search(l):
+def is_section_header(ln: str) -> str:
+    for key, rx in SECTION_HEADERS.items():
+        if rx.search(ln):
             return key
     return ""
 
-def extract_name_after(label: str, txt: str) -> str:
-    m = re.search(label + r"\s*:\s*(.+)", txt, re.I)
-    return norm(m.group(1)) if m else ""
+def is_faculty_line(ln: str) -> bool:
+    return bool(re.match(r"^(Facultad|Escuela|Instituto|Vicerrectorado)\b", ln, re.I))
 
-def parse_people_list(s: str) -> str:
-    s = re.sub(r"\s*[–—-]\s*", " – ", s)
-    s = s.replace(" ,", ",")
-    return norm(s)
+def looks_title_line(ln: str) -> bool:
+    if not ln or len(ln) < 6:
+        return False
+    if DIRECTOR_LABELS.search(ln) or TEAM_LABELS.search(ln) or UNIT_LABELS.search(ln):
+        return False
+    if re.search(r"[«“\"'].*[»”\"']", ln):
+        return True
+    alpha = sum(ch.isalpha() for ch in ln)
+    caps  = sum(ch.isupper() for ch in ln if ch.isalpha())
+    return (alpha >= 6 and (ln.istitle() or (alpha > 0 and caps/alpha >= 0.4)))
 
-def parse_unit(s: str) -> str:
-    m = re.search(r"(Facultad|Escuela|Instituto|Vicerrectorado)[^\n]*", s, re.I)
-    return norm(m.group(0)) if m else ""
+def extract_after(label_rx: re.Pattern, chunk: List[str]) -> str:
+    for ln in chunk:
+        m = re.search(label_rx, ln)
+        if m:
+            return norm(re.sub(label_rx, "", ln)).strip(" .,:;–-\"'«»“”")
+    return ""
 
-def looks_title_line(s: str) -> bool:
-    # heurística para líneas de TÍTULO
-    if len(s) < 6: return False
-    if re.search(r"(Director|Directora|Integrantes|Equipo|Codirector|Unidad)", s, re.I): return False
-    cap = sum(1 for c in s if c.isupper())
-    alpha = sum(1 for c in s if c.isalpha())
-    return (alpha > 0 and (cap/alpha) > 0.4) or s.istitle() or "“" in s or '"' in s
+def extract_unit(chunk: List[str]) -> str:
+    for ln in chunk:
+        if is_faculty_line(ln):
+            return ln
+    for ln in chunk:
+        if UNIT_LABELS.search(ln):
+            return ln
+    return ""
+
+def cut_before_director(chunk: List[str]) -> List[str]:
+    out = []
+    for ln in chunk:
+        if DIRECTOR_LABELS.search(ln):
+            break
+        out.append(ln)
+    return out
+
+def first_title_from(chunk: List[str]) -> str:
+    pre = cut_before_director(chunk)
+    for ln in pre:
+        if looks_title_line(ln):
+            return ln.strip(" .,:;–-\"'«»“”")
+    for ln in pre:
+        if ln:
+            return ln.strip(" .,:;–-\"'«»“”")
+    return ""
 
 def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Crea filas WIDE conforme a FIXED_COLUMNS.
-    Una fila por ítem. Campos no aplicables quedan vacíos.
-    """
     rows: List[Dict[str, Any]] = []
-    sec = ""
+    section = ""
     buf: List[str] = []
+    current_unit = ""
 
-    def flush_buffer(section: str, buffer: List[str]):
-        if not buffer: return
-        chunk = "\n".join(buffer)
-        row_base = empty_row(base_meta)
-        # Ruteo por sección
+    def flush():
+        nonlocal buf, section, current_unit
+        if not buf:
+            return
+        chunk = [ln for ln in buf if ln]
+        unit_here = extract_unit(chunk) or current_unit
+
+        def make_row():
+            r = empty_row(base_meta)
+            # default; cada sección reasigna su campo de unidad específico
+            r["Unidad académica de procedencia del proyecto"] = unit_here
+            return r
+
         if section == "proyectos":
-            row_base["proyectos de investigación"] = "Sí"
-            # Título
-            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)", chunk) or \
-                next((ln for ln in buffer if looks_title_line(ln)), "")
-            row_base["Nombre del proyecto de investigación"] = t.strip("“”\"' ")
-            # Director / Integrantes / Unidad
-            row_base["Director del Proyecto"] = extract_name_after(r"Director(?:a)?", chunk)
-            integ = extract_name_after(r"(Integrantes|Equipo)", chunk)
-            row_base["Integrantes del equipo de investigación"] = parse_people_list(integ)
-            row_base["Unidad académica de procedencia del proyecto"] = parse_unit(chunk)
-            rows.append(row_base)
-
-        elif section == "avance":
-            row_base["Informe de avance"] = "Sí"
-            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)", chunk) or \
-                next((ln for ln in buffer if looks_title_line(ln)), "")
-            row_base["Nombre del proyecto de investigación del Informe de avance"] = t.strip("“”\"' ")
-            row_base["Director del Proyecto del Informe de avance"] = extract_name_after(r"Director(?:a)?", chunk)
-            row_base["Integrantes del equipo de investigación del Informe de avance"] = parse_people_list(
-                extract_name_after(r"(Integrantes|Equipo)", chunk)
-            )
-            row_base["Unidad académica de procedencia del proyecto del Informe de avance"] = parse_unit(chunk)
-            rows.append(row_base)
+            r = make_row()
+            r["proyectos de investigación"] = "Sí"
+            r["Nombre del proyecto de investigación"] = first_title_from(chunk)
+            r["Director del Proyecto"] = extract_after(DIRECTOR_LABELS, chunk)
+            r["Integrantes del equipo de investigación"] = extract_after(TEAM_LABELS, chunk)
+            r["Unidad académica de procedencia del proyecto"] = unit_here
+            if r["Nombre del proyecto de investigación"]:
+                rows.append(r)
 
         elif section == "final":
-            row_base["Informe Final"] = "Sí"
-            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)", chunk) or \
-                next((ln for ln in buffer if looks_title_line(ln)), "")
-            row_base["Nombre del proyecto de investigación del Informe Final"] = t.strip("“”\"' ")
-            row_base["Director del Proyecto del Informe Final"] = extract_name_after(r"Director(?:a)?", chunk)
-            row_base["Integrantes del equipo de investigación del Informe Final"] = parse_people_list(
-                extract_name_after(r"(Integrantes|Equipo)", chunk)
-            )
-            row_base["Unidad académica de procedencia del proyecto del Informe Final"] = parse_unit(chunk)
-            rows.append(row_base)
+            r = make_row()
+            r["Informe Final"] = "Sí"
+            r["Nombre del proyecto de investigación del Informe Final"] = first_title_from(chunk)
+            r["Director del Proyecto del Informe Final"] = extract_after(DIRECTOR_LABELS, chunk)
+            r["Integrantes del equipo de investigación del Informe Final"] = extract_after(TEAM_LABELS, chunk)
+            r["Unidad académica de procedencia del proyecto del Informe Final"] = unit_here
+            if r["Nombre del proyecto de investigación del Informe Final"]:
+                rows.append(r)
+
+        elif section == "avance":
+            r = make_row()
+            r["Informe de avance"] = "Sí"
+            r["Nombre del proyecto de investigación del Informe de avance"] = first_title_from(chunk)
+            r["Director del Proyecto del Informe de avance"] = extract_after(DIRECTOR_LABELS, chunk)
+            r["Integrantes del equipo de investigación del Informe de avance"] = extract_after(TEAM_LABELS, chunk)
+            r["Unidad académica de procedencia del proyecto del Informe de avance"] = unit_here
+            if r["Nombre del proyecto de investigación del Informe de avance"]:
+                rows.append(r)
 
         elif section == "catedra":
-            row_base["Proyectos de investigación de cátedra"] = "Sí"
-            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto|Asignatura)", chunk) or \
-                next((ln for ln in buffer if looks_title_line(ln)), "")
-            row_base["Nombre del proyecto de investigación cátedra"] = t.strip("“”\"' ")
-            row_base["Director del Proyecto del Informe de cátedra"] = extract_name_after(r"Director(?:a)?", chunk)
-            row_base["Integrantes del equipo de investigación del proyecto de cátedra"] = parse_people_list(
-                extract_name_after(r"(Integrantes|Equipo|Docentes)", chunk)
-            )
-            row_base["Unidad académica de procedencia del proyecto de cátedra"] = parse_unit(chunk)
-            rows.append(row_base)
+            r = make_row()
+            r["Proyectos de investigación de cátedra"] = "Sí"
+            r["Nombre del proyecto de investigación cátedra"] = first_title_from(chunk)
+            r["Director del Proyecto del Informe de cátedra"] = extract_after(DIRECTOR_LABELS, chunk)
+            r["Integrantes del equipo de investigación del proyecto de cátedra"] = extract_after(TEAM_LABELS, chunk)
+            r["Unidad académica de procedencia del proyecto de cátedra"] = unit_here
+            if r["Nombre del proyecto de investigación cátedra"]:
+                rows.append(r)
 
         elif section == "publica":
-            row_base["Publicación"] = "Sí"
-            # Tipo
+            r = make_row()
+            r["Publicación"] = "Sí"
+            tx = " ".join(chunk)
             tipo = ""
-            for k in ["revista", "libro", "congreso", "póster", "poster", "cuadernos", "manual"]:
-                if re.search(k, chunk, re.I):
-                    mapa = {
-                        "revista": "revista científica", "libro": "libro",
-                        "congreso":"presentación a congreso", "póster":"póster", "poster":"póster",
-                        "cuadernos":"revista Cuadernos", "manual":"manual"
-                    }
-                    tipo = mapa[k]; break
-            row_base["Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)"] = tipo
-            # Autor y UA
-            row_base["Docente o investigador incluida en la publicación"] = extract_name_after(r"(Autor(?:es)?|Docente|Investigador)", chunk)
-            row_base["Unidad académica (Publicación)"] = parse_unit(chunk)
-            rows.append(row_base)
+            if re.search(r"\brevista\b", tx, re.I): tipo = "revista científica"
+            elif re.search(r"\blibro\b", tx, re.I): tipo = "libro"
+            elif re.search(r"\b(congreso|ponencia|presentaci[oó]n)\b", tx, re.I): tipo = "presentación a congreso"
+            elif re.search(r"p[oó]ster|poster", tx, re.I): tipo = "póster"
+            elif re.search(r"\bcuadernos\b", tx, re.I): tipo = "revista Cuadernos"
+            elif re.search(r"\bmanual\b", tx, re.I): tipo = "manual"
+            r["Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)"] = tipo
+            r["Docente o investigador incluida en la publicación"] = extract_after(re.compile(r"(Autor(?:es)?|Docente|Investigador(?:es)?)\s*:", re.I), chunk)
+            r["Unidad académica (Publicación)"] = unit_here
+            rows.append(r)
 
         elif section == "categ":
-            row_base["Categorización de docentes"] = "Sí"
-            row_base["Nombre del docente categorizado como investigador"] = extract_name_after(r"(Docente|Nombre)", chunk) or \
-                next((ln for ln in buffer if re.search(r"^[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑ ]+,", ln)), "")
-            row_base["Categoría alcanzada por el docente como docente investigador"] = extract_name_after(r"(Categor[ií]a|Tipo)", chunk)
-            row_base["Unidad académica (Categorización)"] = parse_unit(chunk)
-            rows.append(row_base)
+            r = make_row()
+            r["Categorización de docentes"] = "Sí"
+            joined = " | ".join(chunk)
+            mcat = re.search(r"(Categor[ií]a\s*[:\-]?\s*[IVX]+|Investigador(?:\s+\w+){0,3})", joined, re.I)
+            r["Categoría alcanzada por el docente como docente investigador"] = mcat.group(0) if mcat else ""
+            cand = next((ln for ln in chunk if re.search(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]+,\s*[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+", ln)), "")
+            r["Nombre del docente categorizado como investigador"] = cand
+            r["Unidad académica (Categorización)"] = unit_here
+            rows.append(r)
 
         elif section == "beca":
-            # Detectar doctoral/postdoctoral
-            if re.search(r"postdoctoral", chunk, re.I):
-                row_base["Becario de beca cofinanciada postdoctoral"] = "Sí"
-                row_base["Nombre del becario postdoctoral"] = extract_name_after(r"(Becari[oa]|Nombre)", chunk) or \
-                    next((ln for ln in buffer if re.search(r"^[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑ ]+$", ln)), "")
+            r = make_row()
+            if re.search(r"postdoctoral", " ".join(chunk), re.I):
+                r["Becario de beca cofinanciada postdoctoral"] = "Sí"
+                r["Nombre del becario postdoctoral"] = first_title_from(chunk) or extract_after(re.compile(r"(Becari[oa]|Nombre)\s*:", re.I), chunk)
             else:
-                row_base["Becario de beca cofinanciada doctoral"] = "Sí"
-                row_base["Nombre del becario doctoral"] = extract_name_after(r"(Becari[oa]|Nombre)", chunk) or \
-                    next((ln for ln in buffer if re.search(r"^[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑ ]+$", ln)), "")
-            rows.append(row_base)
+                r["Becario de beca cofinanciada doctoral"] = "Sí"
+                r["Nombre del becario doctoral"] = first_title_from(chunk) or extract_after(re.compile(r"(Becari[oa]|Nombre)\s*:", re.I), chunk)
+            rows.append(r)
 
         else:
-            # OTROS TEMAS
-            row_base["OTROS TEMAS"] = chunk
-            rows.append(row_base)
+            r = make_row()
+            r["OTROS TEMAS"] = " ".join(chunk)
+            rows.append(r)
+
+        buf = []
+        current_unit = unit_here
 
     for ln in lines:
-        sec_here = current_section_of(ln)
-        if sec_here:
-            # cambia de sección → flush
-            flush_buffer(sec, buf)
-            sec = sec_here
-            buf = []
-        else:
-            buf.append(ln)
-    flush_buffer(sec, buf)
+        sec = is_section_header(ln)
+        if sec:
+            flush()
+            section = sec
+            continue
+        if is_faculty_line(ln):
+            flush()
+            current_unit = ln
+            continue
+        buf.append(ln)
+
+    flush()
     return rows
 
 # ──────────────────────────────────────────
-# GOOGLE DRIVE (reemplazo por nombre)
+# GOOGLE DRIVE (reemplazo por nombre o por ID fijo)
 # ──────────────────────────────────────────
 def get_creds(scopes):
     sa = st.secrets.get("gcp_service_account")
@@ -319,13 +347,17 @@ def drive_find_file(drive, name: str, folder_id: str) -> str:
     files = res.get("files", [])
     return files[0]["id"] if files else ""
 
-def drive_upload_replace(drive, folder_id: str, name: str, data: bytes, mime: str):
-    file_id = drive_find_file(drive, name, folder_id)
+def drive_upload_replace(drive, folder_id: str, name: str, data: bytes, mime: str, file_id_hint: str = ""):
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
-    if file_id:
-        # update contenido (mantiene el mismo id → Looker sigue apuntando)
-        drive.files().update(fileId=file_id, media_body=media).execute()
-        return file_id
+    # 1) Si me diste el ID directo, actualizo ese
+    if file_id_hint:
+        drive.files().update(fileId=file_id_hint, media_body=media).execute()
+        return file_id_hint
+    # 2) Si no hay ID, busco por nombre dentro de la carpeta
+    fid = drive_find_file(drive, name, folder_id)
+    if fid:
+        drive.files().update(fileId=fid, media_body=media).execute()
+        return fid
     else:
         meta = {"name": name, "parents": [folder_id]}
         f = drive.files().create(body=meta, media_body=media, fields="id").execute()
@@ -353,7 +385,7 @@ for up in uploads:
     base = {"año": year, "fecha": date_str}
     lines = split_lines(raw)
     rows = parse_items_by_section(lines, base)
-    # si el documento no trae ninguna sección detectable, meterlo como "OTROS TEMAS"
+
     if not rows:
         r = empty_row(base)
         r["OTROS TEMAS"] = raw[:1500] + ("…" if len(raw) > 1500 else "")
@@ -366,7 +398,6 @@ if not all_rows:
 
 # Construcción del DataFrame con columnas fijas (orden inmutable)
 df = pd.DataFrame(all_rows)
-# Asegurar todas las columnas (y el orden)
 for col in FIXED_COLUMNS:
     if col not in df.columns:
         df[col] = ""
@@ -395,11 +426,14 @@ st.download_button("📘 Excel (OrdenDelDia_Consejo.xlsx)", data=xlsx_buf, file_
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ──────────────────────────────────────────
-# Subida a Google Drive (reemplazo)
+# Subida a Google Drive (reemplazo; mantiene IDs para Looker)
 # ──────────────────────────────────────────
 st.subheader("3) Subir/Reemplazar en Google Drive (para Looker Studio)")
 folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
 creds = get_creds(["https://www.googleapis.com/auth/drive.file"])
+# Opcional: si ya conocés los IDs en Drive, fijalos en Secrets para update directo
+csv_id_secret  = st.secrets.get("drive_csv_file_id", "")
+xlsx_id_secret = st.secrets.get("drive_xlsx_file_id", "")
 
 if not creds:
     st.caption("ℹ️ Configurá `gcp_service_account` en Secrets para habilitar Drive.")
@@ -407,11 +441,18 @@ else:
     if st.button("🚀 Subir/Reemplazar CSV y Excel en Drive"):
         try:
             drv = drive_client(creds)
-            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME,  csv_bytes, "text/csv")
-            xlsx_id = drive_upload_replace(drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
-                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.success("✅ Archivos actualizados en Drive con el mismo nombre (IDs preservados si ya existían).")
+            csv_id  = drive_upload_replace(
+                drv, folder_id, CSV_NAME, csv_bytes, "text/csv",
+                file_id_hint=csv_id_secret
+            )
+            xlsx_id = drive_upload_replace(
+                drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                file_id_hint=xlsx_id_secret
+            )
+            st.success("✅ Archivos actualizados en Drive.")
             st.caption(f"CSV id: {csv_id} · XLSX id: {xlsx_id}")
-            st.info("Si tus fuentes de Looker Studio referencian estos archivos por ID o por nombre en esa carpeta, se verán actualizadas automáticamente.")
+            st.info("Looker Studio se actualiza solo al mantener los mismos IDs.")
         except Exception as e:
-            st.error(f"Error subiendo a Drive: {e}")
+            st.error("❌ Error subiendo a Drive.")
+            st.exception(e)
