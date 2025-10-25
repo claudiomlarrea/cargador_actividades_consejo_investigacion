@@ -35,7 +35,6 @@ def norm(s: str) -> str:
     return s.strip()
 
 def extract_text_any(uploaded) -> str:
-    """Devuelve texto plano de PDF o DOCX."""
     name = uploaded.name.lower()
     if name.endswith(".pdf"):
         return norm(pdf_extract_text(uploaded))
@@ -45,10 +44,7 @@ def extract_text_any(uploaded) -> str:
     return ""
 
 def find_date_header(text: str) -> Tuple[str, str]:
-    """
-    Detecta año/fecha de la reunión (cabecera). Acepta 20/02/2025, 21-08-25, 18_04_24, etc.
-    """
-    head = text[:1200]
+    head = text[:1500]
     m = re.search(r"\b(\d{1,2})[\/\-\._](\d{1,2})[\/\-\._](\d{2,4})\b", head)
     if m:
         d, mth, y = m.groups()
@@ -58,11 +54,9 @@ def find_date_header(text: str) -> Tuple[str, str]:
         return str(y), f"{d}/{mth}/{y}"
     m2 = re.search(r"a\s+los\s+\d+\s+d[ií]as.*?mes\s+de\s+[a-záéíóú]+.*?dos\s+mil\s+([a-záéíóú]+)", head, re.I|re.S)
     if m2:
-        mapa = {
-            "veinte":2020,"veintiuno":2021,"veintidos":2022,"veintitres":2023,"veinticuatro":2024,
-            "veinticinco":2025,"veintiseis":2026,"veintisiete":2027,"veintiocho":2028,"veintinueve":2029,"treinta":2030
-        }
-        y = unicodedata.normalize("NFKD", m2.group(1)).replace("́","").lower()
+        mapa = {"veinte":2020,"veintiuno":2021,"veintidos":2022,"veintitres":2023,"veinticuatro":2024,"veinticinco":2025}
+        y = unicodedata.normalize("NFKD", m2.group(1)).lower()
+        y = y.replace("́","").replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
         if y in mapa:
             for ln in head.split("\n"):
                 if len(ln.strip()) > 12:
@@ -73,63 +67,28 @@ def find_date_header(text: str) -> Tuple[str, str]:
     return "", ""
 
 # ──────────────────────────────────────────
-# ESQUEMA FIJO DE COLUMNAS (para Looker Studio)
+# ESQUEMA FIJO DE COLUMNAS (Looker)
 # ──────────────────────────────────────────
 FIXED_COLUMNS = [
-    "año",
-    "fecha",
-
-    "proyectos de investigación",
-    "Nombre del proyecto de investigación",
-    "Director del Proyecto",
-    "Integrantes del equipo de investigación",
-    "Unidad académica de procedencia del proyecto",
-
-    "Informe de avance",
-    "Nombre del proyecto de investigación del Informe de avance",
-    "Director del Proyecto del Informe de avance",
-    "Integrantes del equipo de investigación del Informe de avance",
-    "Unidad académica de procedencia del proyecto del Informe de avance",
-
-    "Informe Final",
-    "Nombre del proyecto de investigación del Informe Final",
-    "Director del Proyecto del Informe Final",
-    "Integrantes del equipo de investigación del Informe Final",
-    "Unidad académica de procedencia del proyecto del Informe Final",
-
-    "Proyectos de investigación de cátedra",
-    "Nombre del proyecto de investigación cátedra",
-    "Director del Proyecto del Informe de cátedra",
-    "Integrantes del equipo de investigación del proyecto de cátedra",
-    "Unidad académica de procedencia del proyecto de cátedra",
-
-    "Publicación",
-    "Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)",
-    "Docente o investigador incluida en la publicación",
-    "Unidad académica (Publicación)",
-
-    "Categorización de docentes",
-    "Nombre del docente categorizado como investigador",
-    "Categoría alcanzada por el docente como docente investigador",
-    "Unidad académica (Categorización)",
-
-    "Becario de beca cofinanciada doctoral",
-    "Nombre del becario doctoral",
-    "Becario de beca cofinanciada postdoctoral",
-    "Nombre del becario postdoctoral",
-
+    "año","fecha",
+    "proyectos de investigación","Nombre del proyecto de investigación","Director del Proyecto","Integrantes del equipo de investigación","Unidad académica de procedencia del proyecto",
+    "Informe de avance","Nombre del proyecto de investigación del Informe de avance","Director del Proyecto del Informe de avance","Integrantes del equipo de investigación del Informe de avance","Unidad académica de procedencia del proyecto del Informe de avance",
+    "Informe Final","Nombre del proyecto de investigación del Informe Final","Director del Proyecto del Informe Final","Integrantes del equipo de investigación del Informe Final","Unidad académica de procedencia del proyecto del Informe Final",
+    "Proyectos de investigación de cátedra","Nombre del proyecto de investigación cátedra","Director del Proyecto del Informe de cátedra","Integrantes del equipo de investigación del proyecto de cátedra","Unidad académica de procedencia del proyecto de cátedra",
+    "Publicación","Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)","Docente o investigador incluida en la publicación","Unidad académica (Publicación)",
+    "Categorización de docentes","Nombre del docente categorizado como investigador","Categoría alcanzada por el docente como docente investigador","Unidad académica (Categorización)",
+    "Becario de beca cofinanciada doctoral","Nombre del becario doctoral","Becario de beca cofinanciada postdoctoral","Nombre del becario postdoctoral",
     "OTROS TEMAS"
 ]
-
-def empty_row(base: Dict[str, Any]=None) -> Dict[str, Any]:
-    row = {col: "" for col in FIXED_COLUMNS}
-    if base:
-        row.update({k:v for k,v in base.items() if k in row})
+def empty_row(base=None):
+    row = {c:"" for c in FIXED_COLUMNS}
+    if base: row.update({k:v for k,v in base.items() if k in row})
     return row
 
 # ──────────────────────────────────────────
-# PARSER ROBUSTO (encabezados y títulos sin rótulo)
+# PARSER ROBUSTO (exactitud de títulos)
 # ──────────────────────────────────────────
+# Encabezados de sección
 SECTION_HEADERS = {
     "proyectos": re.compile(r"^(presentaci[oó]n\s+de\s+proyectos?|proyectos?\s+(de\s+)?investigaci[oó]n)\b", re.I),
     "final":     re.compile(r"^informes?\s+final(?:es)?\b", re.I),
@@ -139,34 +98,38 @@ SECTION_HEADERS = {
     "categ":     re.compile(r"^categorizaci[oó]n", re.I),
     "beca":      re.compile(r"^becari[oa]s?\b", re.I),
 }
-
+# Rótulos
 DIRECTOR_LABELS = re.compile(r"\b(Director(?:a)?|Co[- ]?director(?:a)?)\b\s*:", re.I)
-TEAM_LABELS     = re.compile(r"\b(Equipo\s+(de\s+Trabajo|de\s+Investigaci[oó]n)?|Integrantes|Investigadores|Docentes|Estudiantes)\b\s*:", re.I)
+TEAM_LABELS     = re.compile(r"\b(Equipo(?:\s+de\s+(Trabajo|Investigaci[oó]n))?|Integrantes|Investigadores|Docentes|Estudiantes)\b\s*:", re.I)
 UNIT_LABELS     = re.compile(r"\b(Facultad|Escuela|Instituto|Vicerrectorado)\b", re.I)
 
+# Líneas que NUNCA son títulos (ruido típico)
+NO_TITLE_PREFIX = re.compile(r"^(L[ií]neas? de investigaci[oó]n|Enfoque[s]?:|Programa|Jornadas|PEI|Plan|Comisi[oó]n|Convocatoria)\b", re.I)
+
 def split_lines(text: str) -> List[str]:
-    lines = [norm(ln.strip(" \t-•—–")) for ln in text.split("\n")]
+    # separa por líneas y bullets, limpia viñetas y guiones
+    text = re.sub(r"[\u2022\u2023\u25CF\u25CB\u25A0•►▪▫]+", "\n", text)
+    lines = [norm(ln.strip(" \t-—–•")) for ln in text.split("\n")]
     return [ln for ln in lines if ln]
 
 def is_section_header(ln: str) -> str:
     for key, rx in SECTION_HEADERS.items():
-        if rx.search(ln):
-            return key
+        if rx.search(ln): return key
     return ""
 
 def is_faculty_line(ln: str) -> bool:
     return bool(re.match(r"^(Facultad|Escuela|Instituto|Vicerrectorado)\b", ln, re.I))
 
 def looks_title_line(ln: str) -> bool:
-    if not ln or len(ln) < 6:
-        return False
-    if DIRECTOR_LABELS.search(ln) or TEAM_LABELS.search(ln) or UNIT_LABELS.search(ln):
-        return False
-    if re.search(r"[«“\"'].*[»”\"']", ln):
-        return True
+    if not ln or len(ln) < 6: return False
+    if NO_TITLE_PREFIX.search(ln): return False
+    if DIRECTOR_LABELS.search(ln) or TEAM_LABELS.search(ln) or UNIT_LABELS.search(ln): return False
+    # Comillas = muy probable título
+    if re.search(r"[«“\"'].*[»”\"']", ln): return True
+    # Heurística de mayúsculas / Title Case
     alpha = sum(ch.isalpha() for ch in ln)
     caps  = sum(ch.isupper() for ch in ln if ch.isalpha())
-    return (alpha >= 6 and (ln.istitle() or (alpha > 0 and caps/alpha >= 0.4)))
+    return alpha >= 6 and (ln.istitle() or (alpha > 0 and caps/alpha >= 0.40))
 
 def extract_after(label_rx: re.Pattern, chunk: List[str]) -> str:
     for ln in chunk:
@@ -176,19 +139,19 @@ def extract_after(label_rx: re.Pattern, chunk: List[str]) -> str:
     return ""
 
 def extract_unit(chunk: List[str]) -> str:
+    # 1) línea que empieza con Facultad/Escuela/Instituto/Vicerrectorado
     for ln in chunk:
-        if is_faculty_line(ln):
-            return ln
+        if is_faculty_line(ln): return ln
+    # 2) cualquier línea que contenga esas palabras
     for ln in chunk:
-        if UNIT_LABELS.search(ln):
-            return ln
+        if UNIT_LABELS.search(ln): return ln
     return ""
 
 def cut_before_director(chunk: List[str]) -> List[str]:
+    # Cortar el bloque antes de la primera línea "Director:"
     out = []
     for ln in chunk:
-        if DIRECTOR_LABELS.search(ln):
-            break
+        if DIRECTOR_LABELS.search(ln): break
         out.append(ln)
     return out
 
@@ -198,7 +161,7 @@ def first_title_from(chunk: List[str]) -> str:
         if looks_title_line(ln):
             return ln.strip(" .,:;–-\"'«»“”")
     for ln in pre:
-        if ln:
+        if ln and not NO_TITLE_PREFIX.search(ln):
             return ln.strip(" .,:;–-\"'«»“”")
     return ""
 
@@ -210,9 +173,13 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
 
     def flush():
         nonlocal buf, section, current_unit
-        if not buf:
-            return
+        if not buf: return
         chunk = [ln for ln in buf if ln]
+        # descartar bloques completos que son meta/ruido institucional
+        joined = " ".join(chunk)
+        if NO_TITLE_PREFIX.match(chunk[0]) and not any(DIRECTOR_LABELS.search(x) for x in chunk):
+            buf.clear(); return
+
         unit_here = extract_unit(chunk) or current_unit
 
         def make_row():
@@ -227,8 +194,7 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
             r["Director del Proyecto"] = extract_after(DIRECTOR_LABELS, chunk)
             r["Integrantes del equipo de investigación"] = extract_after(TEAM_LABELS, chunk)
             r["Unidad académica de procedencia del proyecto"] = unit_here
-            if r["Nombre del proyecto de investigación"]:
-                rows.append(r)
+            if r["Nombre del proyecto de investigación"]: rows.append(r)
 
         elif section == "final":
             r = make_row()
@@ -237,8 +203,7 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
             r["Director del Proyecto del Informe Final"] = extract_after(DIRECTOR_LABELS, chunk)
             r["Integrantes del equipo de investigación del Informe Final"] = extract_after(TEAM_LABELS, chunk)
             r["Unidad académica de procedencia del proyecto del Informe Final"] = unit_here
-            if r["Nombre del proyecto de investigación del Informe Final"]:
-                rows.append(r)
+            if r["Nombre del proyecto de investigación del Informe Final"]: rows.append(r)
 
         elif section == "avance":
             r = make_row()
@@ -247,8 +212,7 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
             r["Director del Proyecto del Informe de avance"] = extract_after(DIRECTOR_LABELS, chunk)
             r["Integrantes del equipo de investigación del Informe de avance"] = extract_after(TEAM_LABELS, chunk)
             r["Unidad académica de procedencia del proyecto del Informe de avance"] = unit_here
-            if r["Nombre del proyecto de investigación del Informe de avance"]:
-                rows.append(r)
+            if r["Nombre del proyecto de investigación del Informe de avance"]: rows.append(r)
 
         elif section == "catedra":
             r = make_row()
@@ -257,8 +221,7 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
             r["Director del Proyecto del Informe de cátedra"] = extract_after(DIRECTOR_LABELS, chunk)
             r["Integrantes del equipo de investigación del proyecto de cátedra"] = extract_after(TEAM_LABELS, chunk)
             r["Unidad académica de procedencia del proyecto de cátedra"] = unit_here
-            if r["Nombre del proyecto de investigación cátedra"]:
-                rows.append(r)
+            if r["Nombre del proyecto de investigación cátedra"]: rows.append(r)
 
         elif section == "publica":
             r = make_row()
@@ -302,31 +265,27 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
             r["OTROS TEMAS"] = " ".join(chunk)
             rows.append(r)
 
-        buf = []
+        buf.clear()
         current_unit = unit_here
 
+    # Recorrido
     for ln in lines:
         sec = is_section_header(ln)
         if sec:
-            flush()
-            section = sec
-            continue
+            flush(); section = sec; continue
         if is_faculty_line(ln):
-            flush()
-            current_unit = ln
-            continue
+            # Un nuevo bloque de Unidad delimita ÍTEMS; flush previo
+            flush(); current_unit = ln; continue
         buf.append(ln)
-
     flush()
     return rows
 
 # ──────────────────────────────────────────
-# GOOGLE DRIVE (reemplazo por nombre o por ID fijo)
+# GOOGLE DRIVE (reemplazo por nombre o por ID)
 # ──────────────────────────────────────────
 def get_creds(scopes):
     sa = st.secrets.get("gcp_service_account")
-    if not sa:
-        return None
+    if not sa: return None
     if isinstance(sa, dict):
         return Credentials.from_service_account_info(sa, scopes=scopes)
     try:
@@ -352,10 +311,9 @@ def drive_upload_replace(drive, folder_id: str, name: str, data: bytes, mime: st
     if fid:
         drive.files().update(fileId=fid, media_body=media).execute()
         return fid
-    else:
-        meta = {"name": name, "parents": [folder_id]}
-        f = drive.files().create(body=meta, media_body=media, fields="id").execute()
-        return f["id"]
+    meta = {"name": name, "parents": [folder_id]}
+    f = drive.files().create(body=meta, media_body=media, fields="id").execute()
+    return f["id"]
 
 # ──────────────────────────────────────────
 # UI
@@ -364,8 +322,7 @@ st.subheader("1) Subí el/los Órdenes del Día (PDF o DOCX)")
 uploads = st.file_uploader("📂 Archivos", type=["pdf","docx"], accept_multiple_files=True)
 
 if not uploads:
-    st.info("Subí al menos un archivo para continuar.")
-    st.stop()
+    st.info("Subí al menos un archivo para continuar."); st.stop()
 
 all_rows = []
 for up in uploads:
@@ -373,34 +330,26 @@ for up in uploads:
     if not raw:
         st.warning(f"No se pudo leer: {up.name}")
         continue
-
     year, date_str = find_date_header(raw)
     base = {"año": year, "fecha": date_str}
     lines = split_lines(raw)
     rows = parse_items_by_section(lines, base)
-
     if not rows:
-        r = empty_row(base)
-        r["OTROS TEMAS"] = raw[:1500] + ("…" if len(raw) > 1500 else "")
-        rows = [r]
+        r = empty_row(base); r["OTROS TEMAS"] = raw[:1500] + ("…" if len(raw) > 1500 else ""); rows = [r]
     all_rows.extend(rows)
 
 if not all_rows:
-    st.error("No se detectaron ítems en los Órdenes del Día cargados.")
-    st.stop()
+    st.error("No se detectaron ítems en los Órdenes del Día cargados."); st.stop()
 
 df = pd.DataFrame(all_rows)
 for col in FIXED_COLUMNS:
-    if col not in df.columns:
-        df[col] = ""
+    if col not in df.columns: df[col] = ""
 df = df[FIXED_COLUMNS]
 
 st.success("✅ Órdenes del Día procesados.")
 st.dataframe(df, use_container_width=True)
 
-# ──────────────────────────────────────────
-# Descargas locales
-# ──────────────────────────────────────────
+# Descargas
 st.subheader("2) Descargar planillas")
 csv_bytes = df.to_csv(index=False).encode("utf-8")
 st.download_button("📗 CSV (OrdenDelDia_Consejo.csv)", data=csv_bytes, file_name=CSV_NAME, mime="text/csv")
@@ -415,15 +364,10 @@ xlsx_buf = to_xlsx_bytes(df)
 st.download_button("📘 Excel (OrdenDelDia_Consejo.xlsx)", data=xlsx_buf, file_name=XLSX_NAME,
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ──────────────────────────────────────────
-# Subida a Google Drive (reemplazo; mantiene IDs para Looker)
-# ──────────────────────────────────────────
+# Drive
 st.subheader("3) Subir/Reemplazar en Google Drive (para Looker Studio)")
 folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
-# Scope completo de Drive para listar/actualizar por nombre o ID
 creds = get_creds(["https://www.googleapis.com/auth/drive"])
-
-# IDs directos (opcional, recomendado)
 csv_id_secret  = st.secrets.get("drive_csv_file_id", "")
 xlsx_id_secret = st.secrets.get("drive_xlsx_file_id", "")
 
@@ -433,8 +377,7 @@ else:
     if st.button("🚀 Subir/Reemplazar CSV y Excel en Drive"):
         try:
             drv = drive_client(creds)
-            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME, csv_bytes, "text/csv",
-                                           file_id_hint=csv_id_secret)
+            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME, csv_bytes, "text/csv", file_id_hint=csv_id_secret)
             xlsx_id = drive_upload_replace(drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
                                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                            file_id_hint=xlsx_id_secret)
