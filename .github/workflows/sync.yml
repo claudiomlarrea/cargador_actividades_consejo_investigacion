@@ -1,0 +1,47 @@
+name: Sync Actas a Google Sheets
+
+on:
+  push:
+    paths:
+      - "actas/*.pdf"
+      - "actas/*.PDF"
+      - "actas/*.docx"
+      - "actas/*.DOCX"
+      - "config_patterns.yaml"
+      - "extract_actas.py"
+      - "upload_to_sheets.py"
+  schedule:
+    - cron: "0 6 * * *"   # diario 06:00 UTC
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      ACTAS_DIR: actas
+      OUTPUT_CSV: actas_extraccion.csv
+      CONFIG_PATH: config_patterns.yaml
+      SHEET_NAME: Base Consejo de Investigación
+      WORKSHEET_NAME: Actas
+      GOOGLE_APPLICATION_CREDENTIALS: credenciales.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Escribir credenciales de Service Account
+        run: |
+          echo "${{ secrets.GCP_SA_JSON }}" > credenciales.json
+
+      - name: Ejecutar extractor
+        run: python extract_actas.py
+
+      - name: Subir a Google Sheets
+        run: python upload_to_sheets.py
