@@ -4,4 +4,5 @@ pdfminer.six
 python-docx
 google-api-python-client
 google-auth
+google-auth-httplib2
 openpyxl
