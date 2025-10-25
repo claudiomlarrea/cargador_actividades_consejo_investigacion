@@ -10,3 +10,5 @@ gspread>=6.0.0
 google-auth>=2.33.0
 google-auth-httplib2>=0.2.0
 google-api-python-client>=2.142.0
+openpyxl>=3.1.2
+XlsxWriter>=3.2.0
