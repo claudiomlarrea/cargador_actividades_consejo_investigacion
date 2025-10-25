@@ -49,7 +49,6 @@ def find_date_header(text: str) -> Tuple[str, str]:
     Detecta año/fecha de la reunión (cabecera). Acepta 20/02/2025, 21-08-25, 18_04_24, etc.
     """
     head = text[:1200]
-    # dd[/-_]mm[/-_]yyyy | dd[/-_]mm[/-_]yy
     m = re.search(r"\b(\d{1,2})[\/\-\._](\d{1,2})[\/\-\._](\d{2,4})\b", head)
     if m:
         d, mth, y = m.groups()
@@ -57,19 +56,17 @@ def find_date_header(text: str) -> Tuple[str, str]:
         y = int(y)
         d = f"{int(d):02d}"; mth = f"{int(mth):02d}"
         return str(y), f"{d}/{mth}/{y}"
-    # “a los … días del mes de … de dos mil …”
     m2 = re.search(r"a\s+los\s+\d+\s+d[ií]as.*?mes\s+de\s+[a-záéíóú]+.*?dos\s+mil\s+([a-záéíóú]+)", head, re.I|re.S)
     if m2:
         mapa = {
             "veinte":2020,"veintiuno":2021,"veintidos":2022,"veintitres":2023,"veinticuatro":2024,
             "veinticinco":2025,"veintiseis":2026,"veintisiete":2027,"veintiocho":2028,"veintinueve":2029,"treinta":2030
         }
-        y = mapa.get(unicodedata.normalize("NFKD", m2.group(1)).replace("́","").lower())
-        if y:
+        y = unicodedata.normalize("NFKD", m2.group(1)).replace("́","").lower()
+        if y in mapa:
             for ln in head.split("\n"):
                 if len(ln.strip()) > 12:
-                    return str(y), ln.strip()
-    # fallback: primer 20xx
+                    return str(mapa[y]), ln.strip()
     m3 = re.search(r"\b(20\d{2})\b", head)
     if m3:
         return m3.group(1), ""
@@ -220,7 +217,6 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
 
         def make_row():
             r = empty_row(base_meta)
-            # default; cada sección reasigna su campo de unidad específico
             r["Unidad académica de procedencia del proyecto"] = unit_here
             return r
 
@@ -349,11 +345,9 @@ def drive_find_file(drive, name: str, folder_id: str) -> str:
 
 def drive_upload_replace(drive, folder_id: str, name: str, data: bytes, mime: str, file_id_hint: str = ""):
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
-    # 1) Si me diste el ID directo, actualizo ese
     if file_id_hint:
         drive.files().update(fileId=file_id_hint, media_body=media).execute()
         return file_id_hint
-    # 2) Si no hay ID, busco por nombre dentro de la carpeta
     fid = drive_find_file(drive, name, folder_id)
     if fid:
         drive.files().update(fileId=fid, media_body=media).execute()
@@ -380,7 +374,6 @@ for up in uploads:
         st.warning(f"No se pudo leer: {up.name}")
         continue
 
-    # Año / Fecha (metadatos base para cada ítem)
     year, date_str = find_date_header(raw)
     base = {"año": year, "fecha": date_str}
     lines = split_lines(raw)
@@ -396,7 +389,6 @@ if not all_rows:
     st.error("No se detectaron ítems en los Órdenes del Día cargados.")
     st.stop()
 
-# Construcción del DataFrame con columnas fijas (orden inmutable)
 df = pd.DataFrame(all_rows)
 for col in FIXED_COLUMNS:
     if col not in df.columns:
@@ -410,11 +402,9 @@ st.dataframe(df, use_container_width=True)
 # Descargas locales
 # ──────────────────────────────────────────
 st.subheader("2) Descargar planillas")
-# CSV
 csv_bytes = df.to_csv(index=False).encode("utf-8")
 st.download_button("📗 CSV (OrdenDelDia_Consejo.csv)", data=csv_bytes, file_name=CSV_NAME, mime="text/csv")
 
-# XLSX
 def to_xlsx_bytes(df0: pd.DataFrame) -> io.BytesIO:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -430,8 +420,10 @@ st.download_button("📘 Excel (OrdenDelDia_Consejo.xlsx)", data=xlsx_buf, file_
 # ──────────────────────────────────────────
 st.subheader("3) Subir/Reemplazar en Google Drive (para Looker Studio)")
 folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
-creds = get_creds(["https://www.googleapis.com/auth/drive.file"])
-# Opcional: si ya conocés los IDs en Drive, fijalos en Secrets para update directo
+# Scope completo de Drive para listar/actualizar por nombre o ID
+creds = get_creds(["https://www.googleapis.com/auth/drive"])
+
+# IDs directos (opcional, recomendado)
 csv_id_secret  = st.secrets.get("drive_csv_file_id", "")
 xlsx_id_secret = st.secrets.get("drive_xlsx_file_id", "")
 
@@ -441,15 +433,11 @@ else:
     if st.button("🚀 Subir/Reemplazar CSV y Excel en Drive"):
         try:
             drv = drive_client(creds)
-            csv_id  = drive_upload_replace(
-                drv, folder_id, CSV_NAME, csv_bytes, "text/csv",
-                file_id_hint=csv_id_secret
-            )
-            xlsx_id = drive_upload_replace(
-                drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                file_id_hint=xlsx_id_secret
-            )
+            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME, csv_bytes, "text/csv",
+                                           file_id_hint=csv_id_secret)
+            xlsx_id = drive_upload_replace(drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
+                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                           file_id_hint=xlsx_id_secret)
             st.success("✅ Archivos actualizados en Drive.")
             st.caption(f"CSV id: {csv_id} · XLSX id: {xlsx_id}")
             st.info("Looker Studio se actualiza solo al mantener los mismos IDs.")
