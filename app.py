@@ -162,4 +162,216 @@ def extract_title_strict(text: str) -> str:
         # quedarnos con la última línea no vacía de 'pre'
         pre_lines = [ln.strip() for ln in pre.split("\n") if ln.strip()]
         if pre_lines:
-            cand = pre_l_
+            cand = pre_lines[-1]
+            # si tiene prefijo PROJOVI:/PID:/PPI: conservar tras el colon
+            m2 = re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", cand, re.IGNORECASE)
+            if m2:
+                return norm(m2.group(2).strip(" .,:;–-\"'«»“”"))
+            return norm(cand.strip(" .,:;–-\"'«»“”"))
+
+    # 3) primera línea con pinta de título
+    #    - muchas mayúsculas o Capitalización de palabras
+    first_line = t.split("\n", 1)[0]
+    # si la primera línea es muy larga y tiene verbos típicos (“se aprueba…”) -> descartar
+    if re.match(r"(?i)se\s+|los\s+informes|las\s+categor", first_line):
+        first_line = ""
+
+    if not first_line:
+        # buscar una línea candidata dentro del ítem
+        for ln in t.split("\n"):
+            ln = ln.strip()
+            if len(ln) < 6: 
+                continue
+            if re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", ln, re.IGNORECASE):
+                return norm(re.sub(r"^(PROJOVI|PID|PPI)\s*:\s*", "", ln, flags=re.IGNORECASE))
+            # heurística de TÍTULO: ≥ 60% letras mayúsculas/acentuadas o pocas preposiciones
+            cap_ratio = (sum(1 for c in ln if c.isupper()) / max(1, sum(1 for c in ln if c.isalpha())))
+            if cap_ratio > 0.6 or re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", ln):
+                return norm(ln.strip(" .,:;–-\"'«»“”"))
+
+    # 4) comillas
+    m3 = re.search(r"[«“\"']([^\"”»']{6,})[\"”»']", t)
+    if m3:
+        return norm(m3.group(1).strip(" .,:;–-\"'«»“”"))
+
+    # 5) fallback vacío
+    return ""
+
+def find_state(text: str) -> str:
+    for label, pat in [
+        ("Aprobado y elevado", r"\baprobado(?:s)?\b.*\belevad"),
+        ("Aprobado", r"\baprobado(?:s)?\b"),
+        ("Prórroga", r"\bpr[oó]rrog"),
+        ("Baja", r"\bbaja\b"),
+        ("Observaciones", r"\bobservaci[oó]n"),
+        ("Solicitud", r"\bsolicitud\b")
+    ]:
+        if re.search(pat, text.lower()):
+            return label
+    return ""
+
+def find_director(text: str) -> str:
+    m = re.search(r"Director(?:a)?\s*:?\s*(.+)", text, re.IGNORECASE)
+    if not m:
+        return ""
+    linea = norm(m.group(1))
+    linea = clean_person_titles(linea)
+    linea = re.split(r"[;\n]|  +", linea, maxsplit=1)[0]
+    cortes = r"\b(docente[s]?|docentes/as|equipo|integrantes|investigadores/as|alumno[s]?|Carrera|Facultad|Proyecto)\b"
+    linea = re.split(cortes, linea, flags=re.IGNORECASE)[0]
+    linea = linea.strip(" .,")
+    if len(linea) < 3:
+        m2 = re.search(r"Director(?:a)?\s*:?\s*(?:Dr\.?|Dra\.?)?\s*([^,\.;\n]{3,})", text, re.IGNORECASE)
+        if m2:
+            linea = m2.group(1).strip(" .,")
+    return linea or ""
+
+def block_by_faculty(text: str):
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    blocks, current_fac, buf = [], "", []
+    for ln in lines:
+        if re.match(r"^(Facultad|Escuela|Instituto|Vicerrectorado)", ln, re.IGNORECASE):
+            if buf:
+                blocks.append((current_fac, "\n".join(buf)))
+                buf = []
+            current_fac = ln.strip()
+        else:
+            buf.append(ln)
+    if buf:
+        blocks.append((current_fac, "\n".join(buf)))
+    return blocks if blocks else [("", text)]
+
+def split_items(txt: str):
+    parts = re.split(r"\n\s*(?:[\u2022•\-•\*]|\d+\))\s*", "\n"+txt)
+    return [p.strip() for p in parts if len(p.strip()) > 8]
+
+# ──────────────────────────────────────────
+# PARSEO PRINCIPAL
+# ──────────────────────────────────────────
+def parse_acta_to_rows(text: str, fname: str):
+    rows = []
+    acta = get_acta_number(text, fname)
+    fecha = get_fecha(text)
+    for fac, chunk in block_by_faculty(text):
+        for item in split_items(chunk):
+            if is_narrative(item):
+                continue  # descartar bullets narrativos/administrativos
+            topic = classify_topic(item)
+            title = extract_title_strict(item)
+            if not title:
+                # último intento: si hay “Director”, toma el tramo anterior, si no, primera oración sin verbos administrativos
+                title = re.split(r"\bDirector(?:a)?\b\s*:", item, flags=re.IGNORECASE)[0]
+                title = title.split(".")[0]
+                title = norm(title)
+            # limpiar conectores si quedó algo
+            title = re.sub(r"^(PROJOVI|PID|PPI)\s*:\s*", "", title, flags=re.IGNORECASE)
+            title = norm(title.strip(" .,:;–-\"'«»“”"))
+
+            if not title:
+                continue  # si no hay título claro, no creamos fila
+
+            director = find_director(item)
+            estado = find_state(item)
+
+            rows.append({
+                "Año": infer_year_from_text(fecha, full_text=text),
+                "Acta": acta,
+                "Fecha": fecha,
+                "Facultad": fac,
+                "Tipo_tema": topic,
+                "Titulo_o_denominacion": title,
+                "Director": director,
+                "Estado": estado,
+                "Fuente_archivo": fname
+            })
+    return rows
+
+# ──────────────────────────────────────────
+# EXCEL ROBUSTO (openpyxl/xlsxwriter)
+# ──────────────────────────────────────────
+def df_to_excel_bytes(df: pd.DataFrame) -> io.BytesIO:
+    buf = io.BytesIO()
+    try:
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="Actas")
+        buf.seek(0)
+        return buf
+    except Exception:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            df.to_excel(w, index=False, sheet_name="Actas")
+        buf.seek(0)
+        return buf
+
+# ──────────────────────────────────────────
+# GOOGLE DRIVE (opcional)
+# ──────────────────────────────────────────
+def get_creds(scopes):
+    sa = st.secrets.get("gcp_service_account")
+    if not sa: return None
+    if isinstance(sa, dict):
+        return Credentials.from_service_account_info(sa, scopes=scopes)
+    import json
+    return Credentials.from_service_account_info(json.loads(sa), scopes=scopes)
+
+def create_sheet_in_drive(df: pd.DataFrame, name: str, folder_id: str, creds):
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+    except ModuleNotFoundError:
+        st.error("Falta `google-api-python-client` en requirements.txt.")
+        return None
+    drive = build("drive", "v3", credentials=creds)
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(csv_bytes), mimetype="text/csv", resumable=False)
+    metadata = {"name": name, "mimeType": "application/vnd.google-apps.spreadsheet", "parents": [folder_id]}
+    f = drive.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
+    return f.get("webViewLink")
+
+# ──────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────
+files = st.file_uploader("📂 Subí actas (.pdf o .docx)", type=["pdf", "docx"], accept_multiple_files=True)
+if not files:
+    st.info("Subí archivos para comenzar.")
+    st.stop()
+
+all_rows = []
+for f in files:
+    txt = extract_text_any(f)
+    if not txt:
+        st.warning(f"No se pudo leer {f.name}")
+        continue
+    all_rows.extend(parse_acta_to_rows(txt, f.name))
+
+if not all_rows:
+    st.error("No se detectaron ítems válidos en las actas.")
+    st.stop()
+
+df = pd.DataFrame(all_rows)
+ordered = ["Año","Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion","Director","Estado","Fuente_archivo"]
+df = df[ordered]
+
+st.success("✅ Actas procesadas.")
+st.dataframe(df, use_container_width=True)
+
+# Descargas
+st.subheader("Descargar")
+buf_xlsx = df_to_excel_bytes(df)
+st.download_button("📘 Excel (Actas.xlsx)", data=buf_xlsx,
+                   file_name="Actas.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+st.download_button("📗 CSV (Actas.csv)",
+                   data=df.to_csv(index=False).encode("utf-8"),
+                   file_name="Actas.csv", mime="text/csv")
+
+# Drive
+st.subheader("Crear Hoja nativa en Google Drive (opcional)")
+folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
+creds = get_creds(["https://www.googleapis.com/auth/drive.file"])
+if creds and st.button("🚀 Crear hoja en Drive"):
+    link = create_sheet_in_drive(df, "Actas Consejo", folder_id, creds)
+    if link:
+        st.success(f"✅ Hoja creada: [Abrir en Drive]({link})")
+else:
+    st.caption("Cargá las credenciales en Settings → Secrets para habilitar esta opción.")
