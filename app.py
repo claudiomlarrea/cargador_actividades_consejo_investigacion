@@ -132,20 +132,30 @@ def is_narrative(item: str) -> bool:
             return True
     return False
 
-def clean_person_titles(s: str) -> str:
-    return re.sub(r"\b(Dr\.?|Dra\.?|Lic\.?|Prof\.?|Mg\.?|Ing\.?)\b\.?\s*", "", s, flags=re.IGNORECASE)
-
 def strip_leading_index(s: str) -> str:
     return re.sub(r"^\s*\d+\s*[\.\)]\s*", "", s).strip()
 
 BAD_TITLE_PATTERNS = [
     r"^presentaci[oó]n\s+de\s+informes?", r"^director(?:a)?$", r"^\(?\s*20\d{2}\s*-\s*20\d{2}\s*\)?$",
-    r"^punto\s+\d+$", r"^anexo\b", r"^varios$", r"^informes?\b", r"^acta\b"
+    r"^punto\s+\d+$", r"^anexo\b", r"^varios$", r"^informes?\b", r"^acta\b",
+    r"^(dr\.?|dra\.?|lic\.?|mg\.?|ing\.?|prof\.?)\b"  # evita que quede un “Dr. …” como título
 ]
+
 def looks_bad_title(s: str) -> bool:
     t = norm(s).lower()
     if len(t) < 4: return True
     return any(re.search(p, t) for p in BAD_TITLE_PATTERNS)
+
+# heurística simple para detectar nombres de persona (2–4 palabras Capitalizadas)
+def looks_like_person_name(s: str) -> bool:
+    t = norm(s)
+    if re.match(r"(?i)^(Dr\.?|Dra\.?|Lic\.?|Mg\.?|Ing\.?|Prof\.?)\b", t):
+        return True
+    parts = t.replace("Á","A").replace("É","E").replace("Í","I").replace("Ó","O").replace("Ú","U").split()
+    if 2 <= len(parts) <= 4 and all(p and p[0].isupper() for p in parts) and not any(p.isupper() and len(p)>4 for p in parts):
+        # p.ej. "Héctor Gabriel Ávila"
+        return True
+    return False
 
 def extract_title_strict(text: str) -> str:
     """
@@ -159,18 +169,24 @@ def extract_title_strict(text: str) -> str:
     if m:
         cand = re.split(r"\bDirector(?:a)?\b\s*:", m.group(2), flags=re.IGNORECASE)[0]
         cand = strip_leading_index(cand.split("\n")[0]).strip(" .,:;–-\"'«»“”")
-        return norm(cand)
+        cand = norm(cand)
+        if not looks_bad_title(cand) and not looks_like_person_name(cand):
+            return cand
 
     # 2) PROJOVI/PID/PPI
     m = re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", t, re.IGNORECASE)
     if m:
         cand = re.split(r"\bDirector(?:a)?\b\s*:", m.group(2), flags=re.IGNORECASE)[0]
-        return norm(strip_leading_index(cand).strip(" .,:;–-\"'«»“”"))
+        cand = norm(strip_leading_index(cand).strip(" .,:;–-\"'«»“”"))
+        if not looks_bad_title(cand) and not looks_like_person_name(cand):
+            return cand
 
     # 3) comillas
     m = re.search(r"[«“\"']([^\"”»']{6,})[\"”»']", t)
     if m:
-        return norm(strip_leading_index(m.group(1)))
+        cand = norm(strip_leading_index(m.group(1)))
+        if not looks_bad_title(cand) and not looks_like_person_name(cand):
+            return cand
 
     # 4) línea candidata (mayúsculas/Title Case) no administrativa
     for ln in t.split("\n"):
@@ -180,7 +196,9 @@ def extract_title_strict(text: str) -> str:
         if re.match(r"(?i)(se\s+|los\s+informes|las\s+categor|presentaci[oó]n\s+de\s+informes)", ln):
             continue
         if re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", ln) or ln.istitle():
-            return norm(ln.strip(" .,:;–-\"'«»“”"))
+            cand = norm(ln.strip(" .,:;–-\"'«»“”"))
+            if not looks_bad_title(cand) and not looks_like_person_name(cand):
+                return cand
 
     return ""
 
@@ -190,6 +208,7 @@ def extract_title_by_topic(item_text: str, topic: str) -> str:
       - En Informes de avances/finales: limpiar 'Presentación de informes...' y
         buscar el NOMBRE DEL PROYECTO al que refiere el informe.
       - Resto de temas: aplicar extractor estricto.
+      - Nunca devolver nombres de persona.
     """
     t = norm(item_text)
 
@@ -206,51 +225,22 @@ def extract_title_by_topic(item_text: str, topic: str) -> str:
             if m:
                 cand = strip_leading_index(m.group(2))
                 cand = norm(cand.strip(" .,:;–-\"'«»“”"))
-                if cand and not looks_bad_title(cand):
+                if cand and not looks_bad_title(cand) and not looks_like_person_name(cand):
                     return cand
         # fallback: heurística general
         cand = extract_title_strict(t)
-        return "" if looks_bad_title(cand) else cand
+        return "" if (looks_bad_title(cand) or looks_like_person_name(cand)) else cand
 
     # otros temas
     cand = extract_title_strict(t)
     cand = strip_leading_index(cand)
-    if looks_bad_title(cand):
+    if looks_bad_title(cand) or looks_like_person_name(cand):
         return ""
     return cand
 
 # ──────────────────────────────────────────
-# OTROS CAMPOS
+# SEGMENTACIÓN POR FACULTAD E ITEMS
 # ──────────────────────────────────────────
-def find_state(text: str) -> str:
-    for label, pat in [
-        ("Aprobado y elevado", r"\baprobado(?:s)?\b.*\belevad"),
-        ("Aprobado", r"\baprobado(?:s)?\b"),
-        ("Prórroga", r"\bpr[oó]rrog"),
-        ("Baja", r"\bbaja\b"),
-        ("Observaciones", r"\bobservaci[oó]n"),
-        ("Solicitud", r"\bsolicitud\b")
-    ]:
-        if re.search(pat, text.lower()):
-            return label
-    return ""
-
-def find_director(text: str) -> str:
-    m = re.search(r"Director(?:a)?\s*:?\s*(.+)", text, re.IGNORECASE)
-    if not m:
-        return ""
-    linea = norm(m.group(1))
-    linea = clean_person_titles(linea)
-    linea = re.split(r"[;\n]|  +", linea, maxsplit=1)[0]
-    cortes = r"\b(docente[s]?|docentes/as|equipo|integrantes|investigadores/as|alumno[s]?|Carrera|Facultad|Proyecto)\b"
-    linea = re.split(cortes, linea, flags=re.IGNORECASE)[0]
-    linea = linea.strip(" .,")
-    if len(linea) < 3:
-        m2 = re.search(r"Director(?:a)?\s*:?\s*(?:Dr\.?|Dra\.?)?\s*([^,\.;\n]{3,})", text, re.IGNORECASE)
-        if m2:
-            linea = m2.group(1).strip(" .,")
-    return linea or ""
-
 def block_by_faculty(text: str):
     lines = [ln for ln in text.split("\n") if ln.strip()]
     blocks, current_fac, buf = [], "", []
@@ -285,8 +275,7 @@ def parse_acta_to_rows(text: str, fname: str):
             title = extract_title_by_topic(item, topic)
             if not title:
                 continue
-            director = find_director(item)
-            estado = find_state(item)
+            estado = find_state(item)  # puede quedar vacío
             rows.append({
                 "Año": infer_year_from_text(fecha, full_text=text),
                 "Acta": acta,
@@ -294,7 +283,6 @@ def parse_acta_to_rows(text: str, fname: str):
                 "Facultad": fac,
                 "Tipo_tema": topic,
                 "Titulo_o_denominacion": title,
-                "Director": director,
                 "Estado": estado,
                 "Fuente_archivo": fname
             })
@@ -363,7 +351,7 @@ if not all_rows:
     st.stop()
 
 df = pd.DataFrame(all_rows)
-ordered = ["Año","Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion","Director","Estado","Fuente_archivo"]
+ordered = ["Año","Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion","Estado","Fuente_archivo"]
 df = df[ordered]
 
 st.success("✅ Actas procesadas.")
