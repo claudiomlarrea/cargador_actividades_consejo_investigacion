@@ -188,11 +188,17 @@ def ensure_folder_access(folder_id: str, drive):
     return True
 
 def delete_existing_by_name_in_folder(drive, name: str, folder_id: str):
+    safe_name = name.replace("'", "\\'")
     q = (
-        f"name = '{name.replace(\"'\",\"\\'\")}' and "
+        f"name = '{safe_name}' and "
         f"'{folder_id}' in parents and "
-        f"mimeType = 'application/vnd.google-apps/spreadsheet' and "
+        f"mimeType = 'application/vnd.google-apps.spreadsheet' and "
         f"trashed = false"
+    )
+    res = drive.files().list(q=q, fields="files(id)").execute()
+    for f in res.get("files", []):
+        drive.files().delete(fileId=f["id"]).execute()
+
     )
     res = drive.files().list(q=q, fields="files(id)").execute()
     for f in res.get("files", []):
