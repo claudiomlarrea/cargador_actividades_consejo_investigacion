@@ -7,7 +7,7 @@ import streamlit as st
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 
-# Google Sheets (opcional: solo si activás el upload)
+# Google Sheets (solo si se cargan credenciales)
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -15,12 +15,12 @@ try:
 except Exception:
     HAS_GS = False
 
+# ============ CONFIGURACIÓN DE LA APP ============ #
 st.set_page_config(page_title="Extractor de ACTAS → Excel/Sheets", page_icon="🗂️", layout="centered")
 st.title("🗂️ Extractor de ACTAS del Consejo → Excel y Google Sheets")
+st.caption("Subí un PDF o DOCX de acta. La app detecta Proyectos, Informes, Categorización, Jornadas, Cursos y trabajos para la Revista Cuadernos.")
 
-st.caption("Subí un PDF o DOCX de acta. La app detecta Proyectos, Informes (avance/final), Categorización, Jornadas, Cursos y trabajos para Revista Cuadernos.")
-
-# -------------------- Config (patrones) --------------------
+# ---------- PATRONES DE SECCIONES ---------- #
 SECTION_DEFS = [
     {"name": "Proyectos de investigación", "patterns": [r"Presentación de Proyectos", r"Proyectos de Investigación", r"Proyectos de Convocatoria Abierta"]},
     {"name": "Proyectos de cátedra",       "patterns": [r"Proyectos de Asignatura", r"Proyectos Cuadernos de Cátedra"]},
@@ -35,10 +35,9 @@ SECTION_DEFS = [
 FACULTY_HDR = re.compile(r"^(Facultad|Instituto Superior|Vicerrectorado|Escuela)\b.*", re.IGNORECASE)
 ITEM_SPLIT = re.compile(r"\n\s*(?:[\u2022•\-]|[\u25CF\u25A0\u25E6]|\d+\.)\s*")
 
-# -------------------- Utilidades --------------------
+# ---------- UTILIDADES ---------- #
 def _norm(s: str) -> str:
-    if s is None:
-        return ""
+    if s is None: return ""
     s = s.replace("\x00", " ")
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\xa0", " ")
@@ -47,16 +46,13 @@ def _norm(s: str) -> str:
     return s.strip()
 
 def read_pdf_bytes(file_bytes: bytes) -> str:
-    # pdfminer requiere un path o un buffer; usamos BytesIO
     with io.BytesIO(file_bytes) as bio:
-        text = pdf_extract_text(bio)
-    return _norm(text or "")
+        return _norm(pdf_extract_text(bio))
 
 def read_docx_bytes(file_bytes: bytes) -> str:
     with io.BytesIO(file_bytes) as bio:
         doc = DocxDocument(bio)
-        text = "\n".join(p.text for p in doc.paragraphs)
-    return _norm(text or "")
+        return _norm("\n".join(p.text for p in doc.paragraphs))
 
 def find_acta_number(text: str) -> str:
     m = re.search(r"ACTA\s+N[º°]?\s*([0-9]+)", text, flags=re.IGNORECASE)
@@ -73,8 +69,6 @@ def split_sections(text: str):
     for i, sec in enumerate(SECTION_DEFS):
         pat = "|".join([p for p in sec["patterns"]])
         named.append(f"(?P<s{i}>\\b(?:{pat})\\b)")
-    if not named:
-        return [("General", 0, len(text))]
     pattern = re.compile("|".join(named), flags=re.IGNORECASE)
     hits = []
     for m in pattern.finditer(text):
@@ -111,24 +105,18 @@ def extract_candidate_items(text: str):
     cands = []
     for p in parts:
         p = p.strip(" ;\n\t")
-        if len(p) < 6: 
-            continue
+        if len(p) < 6: continue
         if re.search(r"(Proyecto|Denominaci[oó]n|PROJOVI|Informe|Categorizaci[oó]n|Baja del proyecto|Revista|Cuadernos|Cursos?)", p, re.IGNORECASE):
             cands.append(p)
     return cands or [text.strip()]
 
 def infer_estado(text: str) -> str:
     t = text.lower()
-    if "baja del proyecto" in t or re.search(r"\bbaja\b", t):
-        return "Baja"
-    if "prórroga" in t or "prorroga" in t:
-        return "Prórroga"
-    if "aprob" in t and ("elev" in t or "enviado" in t):
-        return "Aprobado y elevado"
-    if "aprob" in t:
-        return "Aprobado"
-    if "solicitud de categorización" in t or "solicitud de categorizacion" in t:
-        return "Solicitud"
+    if "baja del proyecto" in t or re.search(r"\bbaja\b", t): return "Baja"
+    if "prórroga" in t or "prorroga" in t: return "Prórroga"
+    if "aprob" in t and ("elev" in t or "enviado" in t): return "Aprobado y elevado"
+    if "aprob" in t: return "Aprobado"
+    if "solicitud de categorización" in t or "solicitud de categorizacion" in t: return "Solicitud"
     return ""
 
 def infer_destino_publicacion(text: str) -> str:
@@ -185,66 +173,61 @@ def build_dataframe(text: str, source_name: str) -> pd.DataFrame:
                     "Fuente_archivo": source_name,
                 })
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    for c in df.columns:
-        df[c] = df[c].astype(str).str.strip()
-    # Orden recomendado
-    df = df[[
-        "Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion",
-        "Director","Estado","Destino_publicacion","Fuente_archivo"
-    ]]
+    if not df.empty:
+        for c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
     return df
 
-# -------------------- UI --------------------
+# ---------- INTERFAZ STREAMLIT ---------- #
 file = st.file_uploader("Subí el acta (PDF o DOCX)", type=["pdf","docx"])
 col1, col2 = st.columns(2)
 with col1:
-    sheet_name = st.text_input("Nombre del Google Sheet (opcional para subir)", value="Base Consejo de Investigación")
+    sheet_name = st.text_input("Nombre del Google Sheet", value="Base Consejo de Investigación")
 with col2:
-    ws_name = st.text_input("Nombre de la pestaña (worksheet)", value="Actas")
+    ws_name = st.text_input("Nombre de la pestaña", value="Actas")
 
-if file is not None:
-    suffix = (file.name.split(".")[-1] or "").lower()
+if file:
+    suffix = file.name.split(".")[-1].lower()
     raw = file.read()
-    if suffix == "pdf":
-        text = read_pdf_bytes(raw)
-    elif suffix == "docx":
-        text = read_docx_bytes(raw)
-    else:
-        text = ""
+    text = read_pdf_bytes(raw) if suffix == "pdf" else read_docx_bytes(raw)
     if not text.strip():
         st.error("No se pudo leer el archivo.")
         st.stop()
 
     df = build_dataframe(text, file.name)
     if df.empty:
-        st.warning("No se detectaron ítems. Revisá el archivo o los encabezados.")
+        st.warning("No se detectaron ítems.")
         st.stop()
 
     st.success("Extracción completada.")
     st.dataframe(df, use_container_width=True)
 
-    # Descargar Excel
+    # ---------- DESCARGAR EXCEL (con fallback) ----------
     st.subheader("Descargar Excel")
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Actas")
+    def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+        buf = io.BytesIO()
+        try:
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Actas")
+            return buf.getvalue()
+        except Exception:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="Actas")
+            return buf.getvalue()
+
+    excel_bytes = df_to_excel_bytes(df)
     st.download_button(
-        label="💾 Descargar Excel (Actas.xlsx)",
-        data=buf.getvalue(),
+        "💾 Descargar Excel (Actas.xlsx)",
+        data=excel_bytes,
         file_name="Actas.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    # Subir a Google Sheets (opcional)
+    # ---------- SUBIR A GOOGLE SHEETS ----------
     st.subheader("Subir a Google Sheets (opcional)")
-    st.caption("Requiere configurar credenciales en st.secrets['gcp_service_account'] (JSON).")
+    st.caption("Configura en Streamlit Cloud → Settings → Secrets el JSON de Service Account (clave: gcp_service_account).")
     can_upload = HAS_GS and ("gcp_service_account" in st.secrets)
-    if not HAS_GS:
-        st.info("Instalá gspread y google-auth (requirements) para habilitar subida a Sheets.")
-    elif "gcp_service_account" not in st.secrets:
-        st.info("Agregá el secreto 'gcp_service_account' en Settings → Secrets → (contenido JSON de la Service Account).")
     do_upload = st.checkbox("Subir esta tabla a Google Sheets", value=False, disabled=(not can_upload))
 
     if do_upload and can_upload:
@@ -263,6 +246,5 @@ if file is not None:
             ws.clear()
             ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
             st.success(f"✅ Google Sheets actualizado: {sheet_name} / {ws_name} ({len(df)} filas)")
-            st.caption("Conectá esta hoja a Looker Studio y listo.")
         except Exception as e:
             st.error(f"Error subiendo a Google Sheets: {e}")
