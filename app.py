@@ -261,18 +261,37 @@ st.dataframe(df, use_container_width=True)
 # ── Descargas
 st.subheader("Descargar")
 # Excel
-buf_xlsx = io.BytesIO()
-try:
-    with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Actas")
-except Exception:
-    buf_xlsx = io.BytesIO()
-    with pd.ExcelWriter(buf_xlsx, engine="XlsxWriter") as w:
-        df.to_excel(w, index=False, sheet_name="Actas")
-buf_xlsx.seek(0)
-st.download_button("📘 Excel (Actas.xlsx)", data=buf_xlsx,
-                   file_name="Actas.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# --- helper robusto para crear el Excel en memoria ---
+def df_to_excel_bytes(df: pd.DataFrame) -> io.BytesIO:
+    buf = io.BytesIO()
+    try:
+        # 1️⃣ Intentar con openpyxl (el más común en Streamlit Cloud)
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="Actas")
+        buf.seek(0)
+        return buf
+    except Exception:
+        # 2️⃣ Si openpyxl no está, probar con xlsxwriter
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            df.to_excel(w, index=False, sheet_name="Actas")
+        buf.seek(0)
+        return buf
+
+# --- uso en el botón de descarga ---
+st.subheader("Descargar")
+buf_xlsx = df_to_excel_bytes(df)
+st.download_button(
+    "📘 Descargar Excel (Actas.xlsx)",
+    data=buf_xlsx,
+    file_name="Actas.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+# CSV (dejalo como está)
+st.download_button("📗 CSV (Actas.csv)", data=df.to_csv(index=False).encode("utf-8"),
+                   file_name="Actas.csv", mime="text/csv")
+
 # CSV
 st.download_button("📗 CSV (Actas.csv)", data=df.to_csv(index=False).encode("utf-8"),
                    file_name="Actas.csv", mime="text/csv")
