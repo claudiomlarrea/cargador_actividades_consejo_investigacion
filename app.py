@@ -12,12 +12,13 @@ from docx import Document
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 # ──────────────────────────────────────────
 # CONFIG STREAMLIT
 # ──────────────────────────────────────────
-st.set_page_config(page_title="Extractor de Órdenes del Día", page_icon="🗂️", layout="wide")
-st.title("🗂️ Extractor de Órdenes del Día → Planilla estándar + Drive (Looker-ready)")
+st.set_page_config(page_title="Extractor de Órdenes del Día (Acumulativo)", page_icon="🗂️", layout="wide")
+st.title("🗂️ Extractor de Órdenes del Día → Planilla estándar + Drive (Looker-ready, acumulativa)")
 
 DEFAULT_FOLDER_ID = "REEMPLAZAR_CON_TU_CARPETA"  # fallback si no está en secrets
 CSV_NAME  = "OrdenDelDia_Consejo.csv"
@@ -88,7 +89,6 @@ def empty_row(base=None):
 # ──────────────────────────────────────────
 # PARSER ROBUSTO (exactitud de títulos)
 # ──────────────────────────────────────────
-# Encabezados de sección
 SECTION_HEADERS = {
     "proyectos": re.compile(r"^(presentaci[oó]n\s+de\s+proyectos?|proyectos?\s+(de\s+)?investigaci[oó]n)\b", re.I),
     "final":     re.compile(r"^informes?\s+final(?:es)?\b", re.I),
@@ -98,16 +98,12 @@ SECTION_HEADERS = {
     "categ":     re.compile(r"^categorizaci[oó]n", re.I),
     "beca":      re.compile(r"^becari[oa]s?\b", re.I),
 }
-# Rótulos
 DIRECTOR_LABELS = re.compile(r"\b(Director(?:a)?|Co[- ]?director(?:a)?)\b\s*:", re.I)
 TEAM_LABELS     = re.compile(r"\b(Equipo(?:\s+de\s+(Trabajo|Investigaci[oó]n))?|Integrantes|Investigadores|Docentes|Estudiantes)\b\s*:", re.I)
 UNIT_LABELS     = re.compile(r"\b(Facultad|Escuela|Instituto|Vicerrectorado)\b", re.I)
-
-# Líneas que NUNCA son títulos (ruido típico)
 NO_TITLE_PREFIX = re.compile(r"^(L[ií]neas? de investigaci[oó]n|Enfoque[s]?:|Programa|Jornadas|PEI|Plan|Comisi[oó]n|Convocatoria)\b", re.I)
 
 def split_lines(text: str) -> List[str]:
-    # separa por líneas y bullets, limpia viñetas y guiones
     text = re.sub(r"[\u2022\u2023\u25CF\u25CB\u25A0•►▪▫]+", "\n", text)
     lines = [norm(ln.strip(" \t-—–•")) for ln in text.split("\n")]
     return [ln for ln in lines if ln]
@@ -124,9 +120,7 @@ def looks_title_line(ln: str) -> bool:
     if not ln or len(ln) < 6: return False
     if NO_TITLE_PREFIX.search(ln): return False
     if DIRECTOR_LABELS.search(ln) or TEAM_LABELS.search(ln) or UNIT_LABELS.search(ln): return False
-    # Comillas = muy probable título
     if re.search(r"[«“\"'].*[»”\"']", ln): return True
-    # Heurística de mayúsculas / Title Case
     alpha = sum(ch.isalpha() for ch in ln)
     caps  = sum(ch.isupper() for ch in ln if ch.isalpha())
     return alpha >= 6 and (ln.istitle() or (alpha > 0 and caps/alpha >= 0.40))
@@ -139,16 +133,13 @@ def extract_after(label_rx: re.Pattern, chunk: List[str]) -> str:
     return ""
 
 def extract_unit(chunk: List[str]) -> str:
-    # 1) línea que empieza con Facultad/Escuela/Instituto/Vicerrectorado
     for ln in chunk:
         if is_faculty_line(ln): return ln
-    # 2) cualquier línea que contenga esas palabras
     for ln in chunk:
         if UNIT_LABELS.search(ln): return ln
     return ""
 
 def cut_before_director(chunk: List[str]) -> List[str]:
-    # Cortar el bloque antes de la primera línea "Director:"
     out = []
     for ln in chunk:
         if DIRECTOR_LABELS.search(ln): break
@@ -175,7 +166,6 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
         nonlocal buf, section, current_unit
         if not buf: return
         chunk = [ln for ln in buf if ln]
-        # descartar bloques completos que son meta/ruido institucional
         joined = " ".join(chunk)
         if NO_TITLE_PREFIX.match(chunk[0]) and not any(DIRECTOR_LABELS.search(x) for x in chunk):
             buf.clear(); return
@@ -226,14 +216,13 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
         elif section == "publica":
             r = make_row()
             r["Publicación"] = "Sí"
-            tx = " ".join(chunk)
             tipo = ""
-            if re.search(r"\brevista\b", tx, re.I): tipo = "revista científica"
-            elif re.search(r"\blibro\b", tx, re.I): tipo = "libro"
-            elif re.search(r"\b(congreso|ponencia|presentaci[oó]n)\b", tx, re.I): tipo = "presentación a congreso"
-            elif re.search(r"p[oó]ster|poster", tx, re.I): tipo = "póster"
-            elif re.search(r"\bcuadernos\b", tx, re.I): tipo = "revista Cuadernos"
-            elif re.search(r"\bmanual\b", tx, re.I): tipo = "manual"
+            if re.search(r"\brevista\b", joined, re.I): tipo = "revista científica"
+            elif re.search(r"\blibro\b", joined, re.I): tipo = "libro"
+            elif re.search(r"\b(congreso|ponencia|presentaci[oó]n)\b", joined, re.I): tipo = "presentación a congreso"
+            elif re.search(r"p[oó]ster|poster", joined, re.I): tipo = "póster"
+            elif re.search(r"\bcuadernos\b", joined, re.I): tipo = "revista Cuadernos"
+            elif re.search(r"\bmanual\b", joined, re.I): tipo = "manual"
             r["Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)"] = tipo
             r["Docente o investigador incluida en la publicación"] = extract_after(re.compile(r"(Autor(?:es)?|Docente|Investigador(?:es)?)\s*:", re.I), chunk)
             r["Unidad académica (Publicación)"] = unit_here
@@ -242,7 +231,6 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
         elif section == "categ":
             r = make_row()
             r["Categorización de docentes"] = "Sí"
-            joined = " | ".join(chunk)
             mcat = re.search(r"(Categor[ií]a\s*[:\-]?\s*[IVX]+|Investigador(?:\s+\w+){0,3})", joined, re.I)
             r["Categoría alcanzada por el docente como docente investigador"] = mcat.group(0) if mcat else ""
             cand = next((ln for ln in chunk if re.search(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ ]+,\s*[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+", ln)), "")
@@ -252,7 +240,7 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
 
         elif section == "beca":
             r = make_row()
-            if re.search(r"postdoctoral", " ".join(chunk), re.I):
+            if re.search(r"postdoctoral", joined, re.I):
                 r["Becario de beca cofinanciada postdoctoral"] = "Sí"
                 r["Nombre del becario postdoctoral"] = first_title_from(chunk) or extract_after(re.compile(r"(Becari[oa]|Nombre)\s*:", re.I), chunk)
             else:
@@ -268,20 +256,18 @@ def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[
         buf.clear()
         current_unit = unit_here
 
-    # Recorrido
     for ln in lines:
         sec = is_section_header(ln)
         if sec:
             flush(); section = sec; continue
         if is_faculty_line(ln):
-            # Un nuevo bloque de Unidad delimita ÍTEMS; flush previo
             flush(); current_unit = ln; continue
         buf.append(ln)
     flush()
     return rows
 
 # ──────────────────────────────────────────
-# GOOGLE DRIVE (reemplazo por nombre o por ID)
+# GOOGLE DRIVE HELPERS
 # ──────────────────────────────────────────
 def get_creds(scopes):
     sa = st.secrets.get("gcp_service_account")
@@ -315,15 +301,23 @@ def drive_upload_replace(drive, folder_id: str, name: str, data: bytes, mime: st
     f = drive.files().create(body=meta, media_body=media, fields="id").execute()
     return f["id"]
 
+def drive_read_csv_by_id(drive, file_id: str) -> pd.DataFrame:
+    try:
+        data = drive.files().get_media(fileId=file_id).execute()
+        return pd.read_csv(io.BytesIO(data))
+    except Exception:
+        return pd.DataFrame(columns=FIXED_COLUMNS)
+
 # ──────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────
 st.subheader("1) Subí el/los Órdenes del Día (PDF o DOCX)")
 uploads = st.file_uploader("📂 Archivos", type=["pdf","docx"], accept_multiple_files=True)
-
 if not uploads:
-    st.info("Subí al menos un archivo para continuar."); st.stop()
+    st.info("Subí al menos un archivo para continuar.")
+    st.stop()
 
+# Parsear todo lo nuevo
 all_rows = []
 for up in uploads:
     raw = extract_text_any(up)
@@ -339,18 +333,58 @@ for up in uploads:
     all_rows.extend(rows)
 
 if not all_rows:
-    st.error("No se detectaron ítems en los Órdenes del Día cargados."); st.stop()
+    st.error("No se detectaron ítems en los Órdenes del Día cargados.")
+    st.stop()
 
-df = pd.DataFrame(all_rows)
+# DataFrame nuevo (del/los archivos cargados)
+df_new = pd.DataFrame(all_rows)
 for col in FIXED_COLUMNS:
-    if col not in df.columns: df[col] = ""
-df = df[FIXED_COLUMNS]
+    if col not in df_new.columns:
+        df_new[col] = ""
+df_new = df_new[FIXED_COLUMNS]
 
-st.success("✅ Órdenes del Día procesados.")
+# ──────────────────────────────────────────
+# ACUMULAR con lo que ya existe en Drive (si existe)
+# ──────────────────────────────────────────
+st.subheader("2) Consolidación (acumular con el histórico)")
+
+folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
+creds_full = get_creds(["https://www.googleapis.com/auth/drive"])
+csv_id_secret  = st.secrets.get("drive_csv_file_id", "")
+xlsx_id_secret = st.secrets.get("drive_xlsx_file_id", "")
+
+existing_df = pd.DataFrame(columns=FIXED_COLUMNS)
+if creds_full:
+    drv = drive_client(creds_full)
+    # Preferencia: leer por ID si lo diste en los secrets; si no, buscar por nombre.
+    try:
+        if csv_id_secret:
+            existing_df = drive_read_csv_by_id(drv, csv_id_secret)
+        else:
+            maybe_id = drive_find_file(drv, CSV_NAME, folder_id)
+            if maybe_id:
+                existing_df = drive_read_csv_by_id(drv, maybe_id)
+    except Exception:
+        existing_df = pd.DataFrame(columns=FIXED_COLUMNS)
+
+# Combinar y deduplicar
+df = pd.concat([existing_df, df_new], ignore_index=True)
+
+# Reglas de deduplicación: por Año + cualquiera de los campos de nombre de proyecto (proy/avances/finales)
+df["__key__"] = df["año"].astype(str) + "||" + df["Nombre del proyecto de investigación"].fillna("") + "||" + \
+                df["Nombre del proyecto de investigación del Informe de avance"].fillna("") + "||" + \
+                df["Nombre del proyecto de investigación del Informe Final"].fillna("")
+df.drop_duplicates(subset=["__key__"], inplace=True, ignore_index=True)
+df.drop(columns=["__key__"], inplace=True)
+
+# Mostrar consolidado
+st.success("✅ Consolidado listo (histórico + nuevos).")
 st.dataframe(df, use_container_width=True)
 
-# Descargas
-st.subheader("2) Descargar planillas")
+# ──────────────────────────────────────────
+# Descargas locales
+# ──────────────────────────────────────────
+st.subheader("3) Descargar planillas")
 csv_bytes = df.to_csv(index=False).encode("utf-8")
 st.download_button("📗 CSV (OrdenDelDia_Consejo.csv)", data=csv_bytes, file_name=CSV_NAME, mime="text/csv")
 
@@ -364,20 +398,18 @@ xlsx_buf = to_xlsx_bytes(df)
 st.download_button("📘 Excel (OrdenDelDia_Consejo.xlsx)", data=xlsx_buf, file_name=XLSX_NAME,
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# Drive
-st.subheader("3) Subir/Reemplazar en Google Drive (para Looker Studio)")
-folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
-creds = get_creds(["https://www.googleapis.com/auth/drive"])
-csv_id_secret  = st.secrets.get("drive_csv_file_id", "")
-xlsx_id_secret = st.secrets.get("drive_xlsx_file_id", "")
-
-if not creds:
+# ──────────────────────────────────────────
+# Subir/Reemplazar en Drive (mantener IDs → Looker auto)
+# ──────────────────────────────────────────
+st.subheader("4) Subir/Reemplazar en Google Drive (para Looker Studio)")
+if not creds_full:
     st.caption("ℹ️ Configurá `gcp_service_account` en Secrets para habilitar Drive.")
 else:
     if st.button("🚀 Subir/Reemplazar CSV y Excel en Drive"):
         try:
-            drv = drive_client(creds)
-            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME, csv_bytes, "text/csv", file_id_hint=csv_id_secret)
+            drv = drive_client(creds_full)
+            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME, csv_bytes, "text/csv",
+                                           file_id_hint=csv_id_secret)
             xlsx_id = drive_upload_replace(drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
                                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                            file_id_hint=xlsx_id_secret)
