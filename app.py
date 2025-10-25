@@ -1,18 +1,28 @@
 # -*- coding: utf-8 -*-
-import io, re, unicodedata
+import io, re, unicodedata, json
+from typing import List, Dict, Any, Tuple
 import pandas as pd
 import streamlit as st
+
+# Lectura de PDF/DOCX
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document
+
+# Google Drive
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ──────────────────────────────────────────
-# CONFIG
+# CONFIG STREAMLIT
 # ──────────────────────────────────────────
-st.set_page_config(page_title="Extractor de ACTAS del Consejo", page_icon="📑", layout="wide")
-st.title("📑 Extractor de ACTAS → Base institucional (7 temas + Año)")
+st.set_page_config(page_title="Extractor de Órdenes del Día", page_icon="🗂️", layout="wide")
+st.title("🗂️ Extractor de Órdenes del Día → Planilla estándar + Drive (Looker-ready)")
 
-DEFAULT_FOLDER_ID = "1O7xo7cCGkSujhUXIl3fv51S-cniVLmnh"  # carpeta fallback
+DEFAULT_FOLDER_ID = "REEMPLAZAR_CON_TU_CARPETA"  # fallback si no está en secrets
+CSV_NAME  = "OrdenDelDia_Consejo.csv"
+XLSX_NAME = "OrdenDelDia_Consejo.xlsx"
+SHEET_NAME = "OrdenDelDia"
 
 # ──────────────────────────────────────────
 # UTILIDADES GENERALES
@@ -24,356 +34,384 @@ def norm(s: str) -> str:
     s = re.sub(r"\n{2,}", "\n", s)
     return s.strip()
 
-def extract_text_any(f) -> str:
-    if f.name.lower().endswith(".pdf"):
-        return norm(pdf_extract_text(f))
-    if f.name.lower().endswith(".docx"):
-        doc = Document(f)
+def extract_text_any(uploaded) -> str:
+    """Devuelve texto plano de PDF o DOCX."""
+    name = uploaded.name.lower()
+    if name.endswith(".pdf"):
+        return norm(pdf_extract_text(uploaded))
+    if name.endswith(".docx"):
+        doc = Document(uploaded)
         return norm("\n".join(p.text for p in doc.paragraphs))
     return ""
 
-def get_acta_number(text: str, fname: str) -> str:
-    m = re.search(r"ACTA\s+N[º°]?\s*([0-9]+)", text, re.IGNORECASE)
-    if m: return m.group(1)
-    m2 = re.search(r"([0-9]{2,4})", fname)
-    return m2.group(1) if m2 else ""
-
-def get_fecha(text: str) -> str:
-    head = text[:1500]
-    m = re.search(
-        r"a\s+los\s+\d+\s+d[ií]as.*?mes\s+de\s+[a-záéíóú]+.*?de\s+dos\s+mil\s+[a-záéíóú]+",
-        head, flags=re.IGNORECASE | re.DOTALL
-    )
+def find_date_header(text: str) -> Tuple[str, str]:
+    """
+    Intenta detectar fecha/año de la reunión en el encabezado o nombre.
+    Formatos esperados: 20/02/2025, 21-08-25, 18_04_24, 23/10/2025, etc.
+    """
+    head = text[:1200]
+    # dd[/-_]mm[/-_]yyyy | dd[/-_]mm[/-_]yy
+    m = re.search(r"\b(\d{1,2})[\/\-\._](\d{1,2})[\/\-\._](\d{2,4})\b", head)
     if m:
-        return norm(m.group(0))
-    for ln in head.split("\n"):
-        ln = ln.strip()
-        if len(ln) > 20:
-            return ln
-    return text.split("\n", 1)[0]
-
-def infer_year_from_text(s: str, full_text: str = None):
-    if not isinstance(s, str):
-        s = ""
-    t = unicodedata.normalize("NFKD", s).lower()
-    t = t.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-    m = re.search(r"dos\s+mil\s+([a-z]+)", t)
-    mapa = {
-        "veinte": 2020, "veintiuno": 2021, "veintidos": 2022, "veintitres": 2023,
-        "veinticuatro": 2024, "veinticinco": 2025, "veintiseis": 2026,
-        "veintisiete": 2027, "veintiocho": 2028, "veintinueve": 2029, "treinta": 2030
-    }
-    if m and m.group(1) in mapa:
-        return mapa[m.group(1)]
-    scope = (full_text or s or "")[:1500]
-    nums = [int(x) for x in re.findall(r"\b(20\d{2})\b", scope)]
-    nums = [n for n in nums if 2000 <= n <= 2100]
-    if nums:
-        return max(nums)
-    return None
+        d, mth, y = m.groups()
+        y = "20"+y if len(y) == 2 else y
+        y = int(y)
+        d = f"{int(d):02d}"; mth = f"{int(mth):02d}"
+        return str(y), f"{d}/{mth}/{y}"
+    # “a los … días del mes de … de dos mil …”
+    m2 = re.search(r"a\s+los\s+\d+\s+d[ií]as.*?mes\s+de\s+[a-záéíóú]+.*?dos\s+mil\s+([a-záéíóú]+)", head, re.I|re.S)
+    if m2:
+        mapa = {
+            "veinte":2020,"veintiuno":2021,"veintidos":2022,"veintitres":2023,"veinticuatro":2024,
+            "veinticinco":2025,"veintiseis":2026,"veintisiete":2027,"veintiocho":2028,"veintinueve":2029,"treinta":2030
+        }
+        y = mapa.get(unicodedata.normalize("NFKD", m2.group(1)).replace("́","").lower())
+        if y:
+            # tomar primera línea larga como "fecha textual"
+            for ln in head.split("\n"):
+                if len(ln.strip()) > 12:
+                    return str(y), ln.strip()
+    # fallback: primer año 20xx
+    m3 = re.search(r"\b(20\d{2})\b", head)
+    if m3:
+        return m3.group(1), ""
+    return "", ""
 
 # ──────────────────────────────────────────
-# CLASIFICACIÓN (7 temas)
+# ESQUEMA FIJO DE COLUMNAS (para Looker Studio)
 # ──────────────────────────────────────────
-TOPIC_MAP = {
-    "Proyectos de investigación": [
-        r"\bproyectos? de (investigaci[oó]n|convocatoria abierta)\b",
-        r"\bpresentaci[oó]n de proyectos?\b", r"\bprojovi\b", r"\bpid\b", r"\bppi\b"
-    ],
-    "Proyectos de investigación de cátedra": [
-        r"\bproyectos? (de )?(asignatura|c[aá]tedra)\b", r"\bproyectos? cuadernos\b"
-    ],
-    "Informes de avances": [
-        r"\binformes? de avance\b", r"\bpresentaci[oó]n de informes? de avance\b"
-    ],
-    "Informes finales": [
-        r"\binformes? finales?\b", r"\bpresentaci[oó]n de informes? finales?\b"
-    ],
-    "Categorización de investigadores o categorización de docentes": [
-        r"\bcategorizaci[oó]n\b", r"\bsolicitud de categorizaci[oó]n\b",
-        r"\bcategorizaciones? extraordinarias?\b"
-    ],
-    "Jornadas de investigación": [
-        r"\bjornadas? de investigaci[oó]n\b", r"\bjornadas? internas\b"
-    ],
-    "Cursos de capacitación": [
-        r"\bcursos? de capacitaci[oó]n\b", r"\btaller(es)?\b", r"\bcapacitaci[oó]n\b"
-    ],
-}
+FIXED_COLUMNS = [
+    "año",
+    "fecha",
 
-def classify_topic(text: str) -> str:
-    t = text.lower()
-    for topic, pats in TOPIC_MAP.items():
-        for pat in pats:
-            if re.search(pat, t, re.IGNORECASE):
-                return topic
-    return "Proyectos de investigación"  # fallback
+    "proyectos de investigación",
+    "Nombre del proyecto de investigación",
+    "Director del Proyecto",
+    "Integrantes del equipo de investigación",
+    "Unidad académica de procedencia del proyecto",
 
-# ──────────────────────────────────────────
-# FILTROS / EXTRACTORES DE TÍTULO
-# ──────────────────────────────────────────
-NARRATIVE_STARTS = (
-    r"^se\s", r"^los\s+informes", r"^las\s+categor[ií]as", r"^fueron\s+consultadas",
-    r"^siendo\s+las\s+\d", r"^lectura\s+del\s+acta", r"^presentaci[oó]n de (informes|propuestas)",
-    r"^nuevo?s?\s+requerimientos", r"^propuestas?\s+de\s+investigaci[oó]n\s+a\s+la\s+minera",
-)
+    "Informe de avance",
+    "Nombre del proyecto de investigación del Informe de avance",
+    "Director del Proyecto del Informe de avance",
+    "Integrantes del equipo de investigación del Informe de avance",
+    "Unidad académica de procedencia del proyecto del Informe de avance",
 
-def is_narrative(item: str) -> bool:
-    t = norm(item).lower()
-    if len(t) < 20:
-        return True
-    for pat in NARRATIVE_STARTS:
-        if re.search(pat, t):
-            return True
-    # si no hay pistas de proyecto, es probable que sea narrativo
-    if not re.search(r"(proyecto|projovi|pid|ppi|t[ií]tulo|denominaci[oó]n|director)", t):
-        # salvo que parezca un título en mayúsculas
-        if not re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", item):
-            return True
-    return False
+    "Informe Final",
+    "Nombre del proyecto de investigación del Informe Final",
+    "Director del Proyecto del Informe Final",
+    "Integrantes del equipo de investigación del Informe Final",
+    "Unidad académica de procedencia del proyecto del Informe Final",
 
-def strip_leading_index(s: str) -> str:
-    return re.sub(r"^\s*\d+\s*[\.\)]\s*", "", s).strip()
+    "Proyectos de investigación de cátedra",
+    "Nombre del proyecto de investigación cátedra",
+    "Director del Proyecto del Informe de cátedra",
+    "Integrantes del equipo de investigación del proyecto de cátedra",
+    "Unidad académica de procedencia del proyecto de cátedra",
 
-BAD_TITLE_PATTERNS = [
-    r"^presentaci[oó]n\s+de\s+informes?", r"^director(?:a)?$", r"^\(?\s*20\d{2}\s*-\s*20\d{2}\s*\)?$",
-    r"^punto\s+\d+$", r"^anexo\b", r"^varios$", r"^informes?\b", r"^acta\b",
-    r"^(dr\.?|dra\.?|lic\.?|mg\.?|ing\.?|prof\.?)\b"  # evita que quede un “Dr. …” como título
+    "Publicación",
+    "Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)",
+    "Docente o investigador incluida en la publicación",
+    "Unidad académica (Publicación)",  # ← desambiguado para mantener unicidad de columnas
+
+    "Categorización de docentes",
+    "Nombre del docente categorizado como investigador",
+    "Categoría alcanzada por el docente como docente investigador",
+    "Unidad académica (Categorización)",  # ← desambiguado
+
+    # Becarios: unificamos como dos pares (doctoral/postdoctoral)
+    "Becario de beca cofinanciada doctoral",
+    "Nombre del becario doctoral",
+    "Becario de beca cofinanciada postdoctoral",
+    "Nombre del becario postdoctoral",
+
+    "OTROS TEMAS"  # todo lo que no encaje arriba
 ]
 
-def looks_bad_title(s: str) -> bool:
-    t = norm(s).lower()
-    if len(t) < 4: return True
-    return any(re.search(p, t) for p in BAD_TITLE_PATTERNS)
+def empty_row(base: Dict[str, Any]=None) -> Dict[str, Any]:
+    row = {col: "" for col in FIXED_COLUMNS}
+    if base:
+        row.update({k:v for k,v in base.items() if k in row})
+    return row
 
-# heurística simple para detectar nombres de persona (2–4 palabras Capitalizadas)
-def looks_like_person_name(s: str) -> bool:
-    t = norm(s)
-    if re.match(r"(?i)^(Dr\.?|Dra\.?|Lic\.?|Mg\.?|Ing\.?|Prof\.?)\b", t):
-        return True
-    parts = t.replace("Á","A").replace("É","E").replace("Í","I").replace("Ó","O").replace("Ú","U").split()
-    if 2 <= len(parts) <= 4 and all(p and p[0].isupper() for p in parts) and not any(p.isupper() and len(p)>4 for p in parts):
-        # p.ej. "Héctor Gabriel Ávila"
-        return True
-    return False
+# ──────────────────────────────────────────
+# PARSER DE SECCIONES (ÓRDENES DEL DÍA)
+# ──────────────────────────────────────────
+SECTION_MAP = {
+    "proyectos": re.compile(r"^(proyectos? (de )?investigaci[oó]n|presentaci[oó]n de proyectos?)\b", re.I),
+    "avance":    re.compile(r"^informes? de avance\b", re.I),
+    "final":     re.compile(r"^informes? finales?\b", re.I),
+    "catedra":   re.compile(r"(proyectos? (de )?c[aá]tedra|proyectos? cuadernos)", re.I),
+    "publica":   re.compile(r"^publicaci[oó]n|^publicaciones\b", re.I),
+    "categ":     re.compile(r"^categorizaci[oó]n", re.I),
+    "beca":      re.compile(r"^becari[oa]s?", re.I),
+}
 
-def extract_title_strict(text: str) -> str:
-    """
-    Devuelve SOLO el nombre del proyecto/actividad.
-    Regla: prioriza rótulos; luego PROJOVI/PID/PPI; luego comillas; luego línea 'con pinta de título'.
-    """
-    t = norm(text)
+def split_lines(text: str) -> List[str]:
+    lines = [ln.strip(" -•\t") for ln in text.split("\n")]
+    return [ln for ln in lines if ln]
 
-    # 1) rotulados
-    m = re.search(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)\s*:\s*(.+)", t, re.IGNORECASE)
-    if m:
-        cand = re.split(r"\bDirector(?:a)?\b\s*:", m.group(2), flags=re.IGNORECASE)[0]
-        cand = strip_leading_index(cand.split("\n")[0]).strip(" .,:;–-\"'«»“”")
-        cand = norm(cand)
-        if not looks_bad_title(cand) and not looks_like_person_name(cand):
-            return cand
-
-    # 2) PROJOVI/PID/PPI
-    m = re.search(r"(PROJOVI|PID|PPI)\s*:\s*(.+)", t, re.IGNORECASE)
-    if m:
-        cand = re.split(r"\bDirector(?:a)?\b\s*:", m.group(2), flags=re.IGNORECASE)[0]
-        cand = norm(strip_leading_index(cand).strip(" .,:;–-\"'«»“”"))
-        if not looks_bad_title(cand) and not looks_like_person_name(cand):
-            return cand
-
-    # 3) comillas
-    m = re.search(r"[«“\"']([^\"”»']{6,})[\"”»']", t)
-    if m:
-        cand = norm(strip_leading_index(m.group(1)))
-        if not looks_bad_title(cand) and not looks_like_person_name(cand):
-            return cand
-
-    # 4) línea candidata (mayúsculas/Title Case) no administrativa
-    for ln in t.split("\n"):
-        ln = strip_leading_index(ln.strip())
-        if len(ln) < 6:
-            continue
-        if re.match(r"(?i)(se\s+|los\s+informes|las\s+categor|presentaci[oó]n\s+de\s+informes)", ln):
-            continue
-        if re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", ln) or ln.istitle():
-            cand = norm(ln.strip(" .,:;–-\"'«»“”"))
-            if not looks_bad_title(cand) and not looks_like_person_name(cand):
-                return cand
-
+def current_section_of(line: str) -> str:
+    l = line.strip()
+    for key, rx in SECTION_MAP.items():
+        if rx.search(l):
+            return key
     return ""
 
-def extract_title_by_topic(item_text: str, topic: str) -> str:
+def extract_name_after(label: str, txt: str) -> str:
+    m = re.search(label + r"\s*:\s*(.+)", txt, re.I)
+    return norm(m.group(1)) if m else ""
+
+def parse_people_list(s: str) -> str:
+    s = re.sub(r"\s*[–—-]\s*", " – ", s)
+    s = s.replace(" ,", ",")
+    return norm(s)
+
+def parse_unit(s: str) -> str:
+    m = re.search(r"(Facultad|Escuela|Instituto|Vicerrectorado)[^\n]*", s, re.I)
+    return norm(m.group(0)) if m else ""
+
+def looks_title_line(s: str) -> bool:
+    # heurística para líneas de TÍTULO
+    if len(s) < 6: return False
+    if re.search(r"(Director|Directora|Integrantes|Equipo|Codirector|Unidad)", s, re.I): return False
+    cap = sum(1 for c in s if c.isupper())
+    alpha = sum(1 for c in s if c.isalpha())
+    return (alpha > 0 and (cap/alpha) > 0.4) or s.istitle() or "“" in s or '"' in s
+
+def parse_items_by_section(lines: List[str], base_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Ajusta el título según el Tipo_tema:
-      - En Informes de avances/finales: limpiar 'Presentación de informes...' y
-        buscar el NOMBRE DEL PROYECTO al que refiere el informe.
-      - Resto de temas: aplicar extractor estricto.
-      - Nunca devolver nombres de persona.
+    Crea filas WIDE conforme a FIXED_COLUMNS.
+    Una fila por ítem. Campos no aplicables quedan vacíos.
     """
-    t = norm(item_text)
+    rows: List[Dict[str, Any]] = []
+    sec = ""
+    buf: List[str] = []
 
-    if topic in ("Informes de avances", "Informes finales"):
-        # eliminar rótulos genéricos para no devolverlos como título
-        t = re.sub(r"(?i)^\s*\d+\s*[\.\)]\s*", "", t)
-        t = re.sub(r"(?i)presentaci[oó]n\s+de\s+informes?\s+de\s+(avance|final(?:es)?)\s*[:\-]?\s*", "", t)
-        # buscar campos rotulados o PROJOVI/PID/PPI
-        for rgx in [
-            r"(Denominaci[oó]n|T[ií]tulo|Proyecto)\s*:\s*(.+?)\s*(?:Director(?:a)?\s*:|$|\n)",
-            r"(PROJOVI|PID|PPI)\s*:\s*(.+?)\s*(?:Director(?:a)?\s*:|$|\n)"
-        ]:
-            m = re.search(rgx, t, re.IGNORECASE | re.DOTALL)
-            if m:
-                cand = strip_leading_index(m.group(2))
-                cand = norm(cand.strip(" .,:;–-\"'«»“”"))
-                if cand and not looks_bad_title(cand) and not looks_like_person_name(cand):
-                    return cand
-        # fallback: heurística general
-        cand = extract_title_strict(t)
-        return "" if (looks_bad_title(cand) or looks_like_person_name(cand)) else cand
+    def flush_buffer(section: str, buffer: List[str]):
+        if not buffer: return
+        chunk = "\n".join(buffer)
+        row_base = empty_row(base_meta)
+        # Ruteo por sección
+        if section == "proyectos":
+            row_base["proyectos de investigación"] = "Sí"
+            # Título
+            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)", chunk) or \
+                next((ln for ln in buffer if looks_title_line(ln)), "")
+            row_base["Nombre del proyecto de investigación"] = t.strip("“”\"' ")
+            # Director / Integrantes / Unidad
+            row_base["Director del Proyecto"] = extract_name_after(r"Director(?:a)?", chunk)
+            integ = extract_name_after(r"(Integrantes|Equipo)", chunk)
+            row_base["Integrantes del equipo de investigación"] = parse_people_list(integ)
+            row_base["Unidad académica de procedencia del proyecto"] = parse_unit(chunk)
+            rows.append(row_base)
 
-    # otros temas
-    cand = extract_title_strict(t)
-    cand = strip_leading_index(cand)
-    if looks_bad_title(cand) or looks_like_person_name(cand):
-        return ""
-    return cand
+        elif section == "avance":
+            row_base["Informe de avance"] = "Sí"
+            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)", chunk) or \
+                next((ln for ln in buffer if looks_title_line(ln)), "")
+            row_base["Nombre del proyecto de investigación del Informe de avance"] = t.strip("“”\"' ")
+            row_base["Director del Proyecto del Informe de avance"] = extract_name_after(r"Director(?:a)?", chunk)
+            row_base["Integrantes del equipo de investigación del Informe de avance"] = parse_people_list(
+                extract_name_after(r"(Integrantes|Equipo)", chunk)
+            )
+            row_base["Unidad académica de procedencia del proyecto del Informe de avance"] = parse_unit(chunk)
+            rows.append(row_base)
 
-# ──────────────────────────────────────────
-# SEGMENTACIÓN POR FACULTAD E ITEMS
-# ──────────────────────────────────────────
-def block_by_faculty(text: str):
-    lines = [ln for ln in text.split("\n") if ln.strip()]
-    blocks, current_fac, buf = [], "", []
+        elif section == "final":
+            row_base["Informe Final"] = "Sí"
+            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto)", chunk) or \
+                next((ln for ln in buffer if looks_title_line(ln)), "")
+            row_base["Nombre del proyecto de investigación del Informe Final"] = t.strip("“”\"' ")
+            row_base["Director del Proyecto del Informe Final"] = extract_name_after(r"Director(?:a)?", chunk)
+            row_base["Integrantes del equipo de investigación del Informe Final"] = parse_people_list(
+                extract_name_after(r"(Integrantes|Equipo)", chunk)
+            )
+            row_base["Unidad académica de procedencia del proyecto del Informe Final"] = parse_unit(chunk)
+            rows.append(row_base)
+
+        elif section == "catedra":
+            row_base["Proyectos de investigación de cátedra"] = "Sí"
+            t = extract_name_after(r"(Denominaci[oó]n|T[ií]tulo|Proyecto|Asignatura)", chunk) or \
+                next((ln for ln in buffer if looks_title_line(ln)), "")
+            row_base["Nombre del proyecto de investigación cátedra"] = t.strip("“”\"' ")
+            row_base["Director del Proyecto del Informe de cátedra"] = extract_name_after(r"Director(?:a)?", chunk)
+            row_base["Integrantes del equipo de investigación del proyecto de cátedra"] = parse_people_list(
+                extract_name_after(r"(Integrantes|Equipo|Docentes)", chunk)
+            )
+            row_base["Unidad académica de procedencia del proyecto de cátedra"] = parse_unit(chunk)
+            rows.append(row_base)
+
+        elif section == "publica":
+            row_base["Publicación"] = "Sí"
+            # Tipo
+            tipo = ""
+            for k in ["revista", "libro", "congreso", "póster", "poster", "cuadernos", "manual"]:
+                if re.search(k, chunk, re.I):
+                    mapa = {
+                        "revista": "revista científica", "libro": "libro",
+                        "congreso":"presentación a congreso", "póster":"póster", "poster":"póster",
+                        "cuadernos":"revista Cuadernos", "manual":"manual"
+                    }
+                    tipo = mapa[k]; break
+            row_base["Tipo de publicación (revista científica, libro, presentación a congreso, póster, revista Cuadernos, manual)"] = tipo
+            # Autor y UA
+            row_base["Docente o investigador incluida en la publicación"] = extract_name_after(r"(Autor(?:es)?|Docente|Investigador)", chunk)
+            row_base["Unidad académica (Publicación)"] = parse_unit(chunk)
+            rows.append(row_base)
+
+        elif section == "categ":
+            row_base["Categorización de docentes"] = "Sí"
+            row_base["Nombre del docente categorizado como investigador"] = extract_name_after(r"(Docente|Nombre)", chunk) or \
+                next((ln for ln in buffer if re.search(r"^[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑ ]+,", ln)), "")
+            row_base["Categoría alcanzada por el docente como docente investigador"] = extract_name_after(r"(Categor[ií]a|Tipo)", chunk)
+            row_base["Unidad académica (Categorización)"] = parse_unit(chunk)
+            rows.append(row_base)
+
+        elif section == "beca":
+            # Detectar doctoral/postdoctoral
+            if re.search(r"postdoctoral", chunk, re.I):
+                row_base["Becario de beca cofinanciada postdoctoral"] = "Sí"
+                row_base["Nombre del becario postdoctoral"] = extract_name_after(r"(Becari[oa]|Nombre)", chunk) or \
+                    next((ln for ln in buffer if re.search(r"^[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑ ]+$", ln)), "")
+            else:
+                row_base["Becario de beca cofinanciada doctoral"] = "Sí"
+                row_base["Nombre del becario doctoral"] = extract_name_after(r"(Becari[oa]|Nombre)", chunk) or \
+                    next((ln for ln in buffer if re.search(r"^[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑ ]+$", ln)), "")
+            rows.append(row_base)
+
+        else:
+            # OTROS TEMAS
+            row_base["OTROS TEMAS"] = chunk
+            rows.append(row_base)
+
     for ln in lines:
-        if re.match(r"^(Facultad|Escuela|Instituto|Vicerrectorado)", ln, re.IGNORECASE):
-            if buf:
-                blocks.append((current_fac, "\n".join(buf)))
-                buf = []
-            current_fac = ln.strip()
+        sec_here = current_section_of(ln)
+        if sec_here:
+            # cambia de sección → flush
+            flush_buffer(sec, buf)
+            sec = sec_here
+            buf = []
         else:
             buf.append(ln)
-    if buf:
-        blocks.append((current_fac, "\n".join(buf)))
-    return blocks if blocks else [("", text)]
-
-def split_items(txt: str):
-    parts = re.split(r"\n\s*(?:[\u2022•\-•\*]|\d+\))\s*", "\n"+txt)
-    return [p.strip() for p in parts if len(p.strip()) > 8]
-
-# ──────────────────────────────────────────
-# PARSEO PRINCIPAL
-# ──────────────────────────────────────────
-def parse_acta_to_rows(text: str, fname: str):
-    rows = []
-    acta = get_acta_number(text, fname)
-    fecha = get_fecha(text)
-    for fac, chunk in block_by_faculty(text):
-        for item in split_items(chunk):
-            if is_narrative(item):
-                continue
-            topic = classify_topic(item)
-            title = extract_title_by_topic(item, topic)
-            if not title:
-                continue
-            estado = find_state(item)  # puede quedar vacío
-            rows.append({
-                "Año": infer_year_from_text(fecha, full_text=text),
-                "Acta": acta,
-                "Fecha": fecha,
-                "Facultad": fac,
-                "Tipo_tema": topic,
-                "Titulo_o_denominacion": title,
-                "Estado": estado,
-                "Fuente_archivo": fname
-            })
+    flush_buffer(sec, buf)
     return rows
 
 # ──────────────────────────────────────────
-# EXCEL ROBUSTO (openpyxl/xlsxwriter)
-# ──────────────────────────────────────────
-def df_to_excel_bytes(df: pd.DataFrame) -> io.BytesIO:
-    buf = io.BytesIO()
-    try:
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            df.to_excel(w, index=False, sheet_name="Actas")
-        buf.seek(0)
-        return buf
-    except Exception:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            df.to_excel(w, index=False, sheet_name="Actas")
-        buf.seek(0)
-        return buf
-
-# ──────────────────────────────────────────
-# GOOGLE DRIVE (opcional)
+# GOOGLE DRIVE (reemplazo por nombre)
 # ──────────────────────────────────────────
 def get_creds(scopes):
     sa = st.secrets.get("gcp_service_account")
-    if not sa: return None
+    if not sa:
+        return None
     if isinstance(sa, dict):
         return Credentials.from_service_account_info(sa, scopes=scopes)
-    import json
-    return Credentials.from_service_account_info(json.loads(sa), scopes=scopes)
-
-def create_sheet_in_drive(df: pd.DataFrame, name: str, folder_id: str, creds):
     try:
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaIoBaseUpload
-    except ModuleNotFoundError:
-        st.error("Falta `google-api-python-client` en requirements.txt.")
+        return Credentials.from_service_account_info(json.loads(sa), scopes=scopes)
+    except Exception:
         return None
-    drive = build("drive", "v3", credentials=creds)
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    media = MediaIoBaseUpload(io.BytesIO(csv_bytes), mimetype="text/csv", resumable=False)
-    metadata = {"name": name, "mimeType": "application/vnd.google-apps.spreadsheet", "parents": [folder_id]}
-    f = drive.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
-    return f.get("webViewLink")
+
+def drive_client(creds):
+    return build("drive", "v3", credentials=creds)
+
+def drive_find_file(drive, name: str, folder_id: str) -> str:
+    q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
+    res = drive.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else ""
+
+def drive_upload_replace(drive, folder_id: str, name: str, data: bytes, mime: str):
+    file_id = drive_find_file(drive, name, folder_id)
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    if file_id:
+        # update contenido (mantiene el mismo id → Looker sigue apuntando)
+        drive.files().update(fileId=file_id, media_body=media).execute()
+        return file_id
+    else:
+        meta = {"name": name, "parents": [folder_id]}
+        f = drive.files().create(body=meta, media_body=media, fields="id").execute()
+        return f["id"]
 
 # ──────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────
-files = st.file_uploader("📂 Subí actas (.pdf o .docx)", type=["pdf", "docx"], accept_multiple_files=True)
-if not files:
-    st.info("Subí archivos para comenzar.")
+st.subheader("1) Subí el/los Órdenes del Día (PDF o DOCX)")
+uploads = st.file_uploader("📂 Archivos", type=["pdf","docx"], accept_multiple_files=True)
+
+if not uploads:
+    st.info("Subí al menos un archivo para continuar.")
     st.stop()
 
 all_rows = []
-for f in files:
-    txt = extract_text_any(f)
-    if not txt:
-        st.warning(f"No se pudo leer {f.name}")
+for up in uploads:
+    raw = extract_text_any(up)
+    if not raw:
+        st.warning(f"No se pudo leer: {up.name}")
         continue
-    all_rows.extend(parse_acta_to_rows(txt, f.name))
+
+    # Año / Fecha (metadatos base para cada ítem)
+    year, date_str = find_date_header(raw)
+    base = {"año": year, "fecha": date_str}
+    lines = split_lines(raw)
+    rows = parse_items_by_section(lines, base)
+    # si el documento no trae ninguna sección detectable, meterlo como "OTROS TEMAS"
+    if not rows:
+        r = empty_row(base)
+        r["OTROS TEMAS"] = raw[:1500] + ("…" if len(raw) > 1500 else "")
+        rows = [r]
+    all_rows.extend(rows)
 
 if not all_rows:
-    st.error("No se detectaron ítems válidos en las actas.")
+    st.error("No se detectaron ítems en los Órdenes del Día cargados.")
     st.stop()
 
+# Construcción del DataFrame con columnas fijas (orden inmutable)
 df = pd.DataFrame(all_rows)
-ordered = ["Año","Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion","Estado","Fuente_archivo"]
-df = df[ordered]
+# Asegurar todas las columnas (y el orden)
+for col in FIXED_COLUMNS:
+    if col not in df.columns:
+        df[col] = ""
+df = df[FIXED_COLUMNS]
 
-st.success("✅ Actas procesadas.")
+st.success("✅ Órdenes del Día procesados.")
 st.dataframe(df, use_container_width=True)
 
-# Descargas
-st.subheader("Descargar")
-buf_xlsx = df_to_excel_bytes(df)
-st.download_button("📘 Excel (Actas.xlsx)", data=buf_xlsx,
-                   file_name="Actas.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-st.download_button("📗 CSV (Actas.csv)",
-                   data=df.to_csv(index=False).encode("utf-8"),
-                   file_name="Actas.csv", mime="text/csv")
+# ──────────────────────────────────────────
+# Descargas locales
+# ──────────────────────────────────────────
+st.subheader("2) Descargar planillas")
+# CSV
+csv_bytes = df.to_csv(index=False).encode("utf-8")
+st.download_button("📗 CSV (OrdenDelDia_Consejo.csv)", data=csv_bytes, file_name=CSV_NAME, mime="text/csv")
 
-# Drive
-st.subheader("Crear Hoja nativa en Google Drive (opcional)")
+# XLSX
+def to_xlsx_bytes(df0: pd.DataFrame) -> io.BytesIO:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df0.to_excel(w, index=False, sheet_name=SHEET_NAME)
+    buf.seek(0); return buf
+
+xlsx_buf = to_xlsx_bytes(df)
+st.download_button("📘 Excel (OrdenDelDia_Consejo.xlsx)", data=xlsx_buf, file_name=XLSX_NAME,
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ──────────────────────────────────────────
+# Subida a Google Drive (reemplazo)
+# ──────────────────────────────────────────
+st.subheader("3) Subir/Reemplazar en Google Drive (para Looker Studio)")
 folder_id = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
 creds = get_creds(["https://www.googleapis.com/auth/drive.file"])
-if creds and st.button("🚀 Crear hoja en Drive"):
-    link = create_sheet_in_drive(df, "Actas Consejo", folder_id, creds)
-    if link:
-        st.success(f"✅ Hoja creada: [Abrir en Drive]({link})")
+
+if not creds:
+    st.caption("ℹ️ Configurá `gcp_service_account` en Secrets para habilitar Drive.")
 else:
-    st.caption("Cargá las credenciales en Settings → Secrets para habilitar esta opción.")
+    if st.button("🚀 Subir/Reemplazar CSV y Excel en Drive"):
+        try:
+            drv = drive_client(creds)
+            csv_id  = drive_upload_replace(drv, folder_id, CSV_NAME,  csv_bytes, "text/csv")
+            xlsx_id = drive_upload_replace(drv, folder_id, XLSX_NAME, xlsx_buf.getvalue(),
+                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.success("✅ Archivos actualizados en Drive con el mismo nombre (IDs preservados si ya existían).")
+            st.caption(f"CSV id: {csv_id} · XLSX id: {xlsx_id}")
+            st.info("Si tus fuentes de Looker Studio referencian estos archivos por ID o por nombre en esa carpeta, se verán actualizadas automáticamente.")
+        except Exception as e:
+            st.error(f"Error subiendo a Drive: {e}")
