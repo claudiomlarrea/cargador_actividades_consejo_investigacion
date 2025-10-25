@@ -1,0 +1,40 @@
+# Patrones de encabezados de secciones tal como aparecen en las ACTAS
+sections:
+  - name: "Proyectos de investigación"
+    patterns:
+      - "Presentación de Proyectos"
+      - "Proyectos de Investigación"
+      - "Proyectos de Convocatoria Abierta"
+  - name: "Proyectos de cátedra"
+    patterns:
+      - "Proyectos de Asignatura"
+      - "Proyectos Cuadernos de Cátedra"
+  - name: "Informes finales"
+    patterns:
+      - "Presentación de Informes Finales"
+      - "Informes Finales"
+  - name: "Informes de avance"
+    patterns:
+      - "Presentación de Informes de Avance"
+      - "Informes de Avance"
+  - name: "Categorización"
+    patterns:
+      - "Solicitud de Categorización"
+      - "Categorizaciones Extraordinarias"
+      - "Categorización de investigadores"
+      - "Categorización de docentes"
+  - name: "Jornadas de investigación"
+    patterns:
+      - "Jornadas de Investigación"
+      - "Jornadas internas de investigación"
+  - name: "Trabajos Revista Cuadernos"
+    patterns:
+      - "Revista Cuadernos"
+      - "Cuadernos de la Secretaría de Investigación"
+      - "presentación de resúmenes"
+      - "trabajos para la revista"
+      - "resúmenes para Cuadernos"
+  - name: "Cursos"
+    patterns:
+      - "Cursos de capacitación"
+      - "Cursos"
