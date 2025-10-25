@@ -7,20 +7,22 @@ import streamlit as st
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 
-# Google Sheets (solo si se cargan credenciales)
+# Google Sheets / Drive
 try:
     import gspread
     from google.oauth2.service_account import Credentials
-    HAS_GS = True
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+    HAS_GOOGLE = True
 except Exception:
-    HAS_GS = False
+    HAS_GOOGLE = False
 
-# ============ CONFIGURACIÓN DE LA APP ============ #
-st.set_page_config(page_title="Extractor de ACTAS → Excel/Sheets", page_icon="🗂️", layout="centered")
-st.title("🗂️ Extractor de ACTAS del Consejo → Excel y Google Sheets")
-st.caption("Subí un PDF o DOCX de acta. La app detecta Proyectos, Informes, Categorización, Jornadas, Cursos y trabajos para la Revista Cuadernos.")
+# ================== CONFIG UI ================== #
+st.set_page_config(page_title="Extractor de ACTAS → Sheets/Excel", page_icon="🗂️", layout="centered")
+st.title("🗂️ Extractor de ACTAS del Consejo → Google Sheets / Excel")
+st.caption("Subí un PDF o DOCX de acta. Detecta Proyectos, Informes (avance/final), Categorización, Jornadas, Cursos y trabajos para la Revista Cuadernos.")
 
-# ---------- PATRONES DE SECCIONES ---------- #
+# ================== PATRONES ================== #
 SECTION_DEFS = [
     {"name": "Proyectos de investigación", "patterns": [r"Presentación de Proyectos", r"Proyectos de Investigación", r"Proyectos de Convocatoria Abierta"]},
     {"name": "Proyectos de cátedra",       "patterns": [r"Proyectos de Asignatura", r"Proyectos Cuadernos de Cátedra"]},
@@ -33,9 +35,9 @@ SECTION_DEFS = [
 ]
 
 FACULTY_HDR = re.compile(r"^(Facultad|Instituto Superior|Vicerrectorado|Escuela)\b.*", re.IGNORECASE)
-ITEM_SPLIT = re.compile(r"\n\s*(?:[\u2022•\-]|[\u25CF\u25A0\u25E6]|\d+\.)\s*")
+ITEM_SPLIT  = re.compile(r"\n\s*(?:[\u2022•\-]|[\u25CF\u25A0\u25E6]|\d+\.)\s*")
 
-# ---------- UTILIDADES ---------- #
+# ================== UTILIDADES ================== #
 def _norm(s: str) -> str:
     if s is None: return ""
     s = s.replace("\x00", " ")
@@ -47,7 +49,7 @@ def _norm(s: str) -> str:
 
 def read_pdf_bytes(file_bytes: bytes) -> str:
     with io.BytesIO(file_bytes) as bio:
-        return _norm(pdf_extract_text(bio))
+        return _norm(pdf_extract_text(bio) or "")
 
 def read_docx_bytes(file_bytes: bytes) -> str:
     with io.BytesIO(file_bytes) as bio:
@@ -96,8 +98,7 @@ def chunk_by_faculty(section_text: str):
             current = ln
         else:
             buf.append(ln)
-    if buf:
-        blocks.append((current, "\n".join(buf)))
+    if buf: blocks.append((current, "\n".join(buf)))
     return blocks or [(None, section_text)]
 
 def extract_candidate_items(text: str):
@@ -133,20 +134,16 @@ def extract_title_director(text: str):
             director = m.group(2).strip(" .")
     if not director:
         m2 = re.search(r"Director(?:a)?\s*:\s*([^.]+)", text, re.IGNORECASE)
-        if m2:
-            director = m2.group(1).strip(" .")
+        if m2: director = m2.group(1).strip(" .")
     if not title:
         m3 = re.search(r"Denominaci[oó]n.*?:\s*(.+?)(?:\.|$)", text, re.IGNORECASE)
-        if m3:
-            title = m3.group(1).strip()
+        if m3: title = m3.group(1).strip()
     if not title:
         m4 = re.search(r"PROJOVI\s*:\s*(.+?)(?:\.|$)", text, re.IGNORECASE)
-        if m4:
-            title = m4.group(1).strip()
+        if m4: title = m4.group(1).strip()
     if not title:
         m5 = re.search(r"[«“\"']([^\"”»']+)[\"”»']", text)
-        if m5:
-            title = m5.group(1).strip()
+        if m5: title = m5.group(1).strip()
     return title, director
 
 def build_dataframe(text: str, source_name: str) -> pd.DataFrame:
@@ -176,15 +173,75 @@ def build_dataframe(text: str, source_name: str) -> pd.DataFrame:
     if not df.empty:
         for c in df.columns:
             df[c] = df[c].astype(str).str.strip()
+        df = df[["Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion","Director","Estado","Destino_publicacion","Fuente_archivo"]]
     return df
 
-# ---------- INTERFAZ STREAMLIT ---------- #
+# ================== AUTH HELPERS ================== #
+def get_google_creds(scopes):
+    if not HAS_GOOGLE or "gcp_service_account" not in st.secrets:
+        return None
+    return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+
+def upload_df_to_google_sheets(df: pd.DataFrame, sheet_name: str, ws_name: str):
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
+    creds = get_google_creds(scopes)
+    if creds is None:
+        raise RuntimeError("No hay credenciales en st.secrets['gcp_service_account'].")
+
+    client = gspread.authorize(creds)
+    try:
+        sh = client.open(sheet_name)
+    except gspread.exceptions.SpreadsheetNotFound:
+        sh = client.create(sheet_name)
+    try:
+        ws = sh.worksheet(ws_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=ws_name, rows=1000, cols=20)
+    ws.clear()
+    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
+    return sh.url
+
+def create_native_sheet_on_drive_from_df(df: pd.DataFrame, file_name: str, parent_folder_id: str | None = None):
+    """
+    Crea DIRECTAMENTE una Hoja de Cálculo de Google (nativa) en Drive,
+    convirtiendo un CSV en memoria (sin guardar archivo).
+    """
+    scopes = [
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = get_google_creds(scopes)
+    if creds is None:
+        raise RuntimeError("No hay credenciales en st.secrets['gcp_service_account'].")
+
+    drive = build("drive", "v3", credentials=creds)
+
+    # CSV en memoria
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(csv_bytes), mimetype="text/csv", resumable=False)
+
+    metadata = {
+        "name": file_name,
+        "mimeType": "application/vnd.google-apps.spreadsheet"
+    }
+    if parent_folder_id:
+        metadata["parents"] = [parent_folder_id]
+
+    file = drive.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
+    return file.get("webViewLink")
+
+# ================== UI ================== #
 file = st.file_uploader("Subí el acta (PDF o DOCX)", type=["pdf","docx"])
 col1, col2 = st.columns(2)
 with col1:
-    sheet_name = st.text_input("Nombre del Google Sheet", value="Base Consejo de Investigación")
+    sheet_name = st.text_input("Nombre del Google Sheet (para subir con gspread)", value="Base Consejo de Investigación")
 with col2:
-    ws_name = st.text_input("Nombre de la pestaña", value="Actas")
+    ws_name = st.text_input("Nombre de la pestaña (worksheet)", value="Actas")
+
+parent_id = st.text_input("ID de carpeta en Drive (opcional, para crear Sheet nativo)", value="", help="Pega aquí el ID de la carpeta de Drive donde querés crear la hoja nativa (opcional).")
 
 if file:
     suffix = file.name.split(".")[-1].lower()
@@ -202,49 +259,49 @@ if file:
     st.success("Extracción completada.")
     st.dataframe(df, use_container_width=True)
 
-    # ---------- DESCARGAR EXCEL (con fallback) ----------
-    st.subheader("Descargar Excel")
+    # -------- Descargar Excel (con fallback) -------- #
+    st.subheader("Descargar Excel / CSV")
     def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
         buf = io.BytesIO()
         try:
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False, sheet_name="Actas")
-            return buf.getvalue()
         except Exception:
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
                 df.to_excel(writer, index=False, sheet_name="Actas")
-            return buf.getvalue()
+        return buf.getvalue()
 
     excel_bytes = df_to_excel_bytes(df)
-    st.download_button(
-        "💾 Descargar Excel (Actas.xlsx)",
-        data=excel_bytes,
-        file_name="Actas.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    st.download_button("💾 Descargar Excel (Actas.xlsx)", data=excel_bytes,
+                       file_name="Actas.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("⬇️ Descargar CSV (Actas.csv)", data=df.to_csv(index=False).encode("utf-8"),
+                       file_name="Actas.csv", mime="text/csv")
 
-    # ---------- SUBIR A GOOGLE SHEETS ----------
-    st.subheader("Subir a Google Sheets (opcional)")
-    st.caption("Configura en Streamlit Cloud → Settings → Secrets el JSON de Service Account (clave: gcp_service_account).")
-    can_upload = HAS_GS and ("gcp_service_account" in st.secrets)
-    do_upload = st.checkbox("Subir esta tabla a Google Sheets", value=False, disabled=(not can_upload))
-
-    if do_upload and can_upload:
+    # -------- Subir a Google Sheets (gspread) -------- #
+    st.subheader("Actualizar Google Sheets (con gspread)")
+    st.caption("Requiere `st.secrets['gcp_service_account']` con tu JSON de Service Account.")
+    can_google = HAS_GOOGLE and ("gcp_service_account" in st.secrets)
+    do_upload = st.checkbox("Subir/actualizar hoja (reemplaza el contenido)", value=False, disabled=not can_google)
+    if do_upload and can_google:
         try:
-            scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-            creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-            client = gspread.authorize(creds)
-            try:
-                sh = client.open(sheet_name)
-            except gspread.exceptions.SpreadsheetNotFound:
-                sh = client.create(sheet_name)
-            try:
-                ws = sh.worksheet(ws_name)
-            except gspread.exceptions.WorksheetNotFound:
-                ws = sh.add_worksheet(title=ws_name, rows=1000, cols=20)
-            ws.clear()
-            ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
-            st.success(f"✅ Google Sheets actualizado: {sheet_name} / {ws_name} ({len(df)} filas)")
+            url = upload_df_to_google_sheets(df, sheet_name, ws_name)
+            st.success(f"✅ Hoja actualizada: {sheet_name} / {ws_name}")
+            st.write("Abrir:", url)
         except Exception as e:
-            st.error(f"Error subiendo a Google Sheets: {e}")
+            st.error(f"Error al actualizar Google Sheets: {e}")
+
+    # -------- Crear hoja nativa en Drive (conversión automática) -------- #
+    st.subheader("Crear **Hoja de Cálculo de Google** nativa en Drive (conversión automática)")
+    st.caption("Genera una hoja nativa en tu Drive desde este resultado, sin pasar por .xlsx. Opcionalmente indicá la carpeta destino.")
+    do_convert = st.checkbox("Crear hoja nativa en Drive (convierte desde CSV)", value=False, disabled=not can_google)
+    new_name = st.text_input("Nombre del archivo en Drive (nuevo)", value=f"Actas - {df['Acta'].iat[0] or 'Consejo'}")
+    if do_convert and can_google:
+        try:
+            link = create_native_sheet_on_drive_from_df(df, new_name, parent_id or None)
+            st.success("✅ Hoja de Cálculo creada en Drive (nativa).")
+            st.write("Abrir:", link)
+            st.caption("Conectá esta hoja a Looker Studio para sincronización directa.")
+        except Exception as e:
+            st.error(f"Error al crear hoja nativa en Drive: {e}")
