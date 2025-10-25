@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-import io, re, unicodedata
+import io, re, unicodedata, datetime as dt
 import pandas as pd
 import streamlit as st
 
-# Lectores de documentos
+# Lectores
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 
-# Google Sheets / Drive
+# Google
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -17,10 +17,13 @@ try:
 except Exception:
     HAS_GOOGLE = False
 
-# ================== CONFIG UI ================== #
-st.set_page_config(page_title="Extractor de ACTAS → Sheets/Excel", page_icon="🗂️", layout="centered")
-st.title("🗂️ Extractor de ACTAS del Consejo → Google Sheets / Excel")
-st.caption("Subí un PDF o DOCX de acta. Detecta Proyectos, Informes (avance/final), Categorización, Jornadas, Cursos y trabajos para la Revista Cuadernos.")
+# ================== CONFIG ================== #
+st.set_page_config(page_title="Extractor de ACTAS → Google Sheets", page_icon="🗂️", layout="centered")
+st.title("🗂️ Extractor de ACTAS del Consejo → Hoja de Google automática")
+
+# Carpeta de destino en Drive (por defecto la que compartiste)
+DEFAULT_FOLDER_ID = "1O7xo7cCGkSujhUXIl3fv51S-cniVLmnh"
+FOLDER_ID = st.secrets.get("drive_folder_id", DEFAULT_FOLDER_ID)
 
 # ================== PATRONES ================== #
 SECTION_DEFS = [
@@ -33,7 +36,6 @@ SECTION_DEFS = [
     {"name": "Trabajos Revista Cuadernos",  "patterns": [r"Revista Cuadernos", r"Cuadernos de la Secretaría de Investigación", r"presentación de resúmenes", r"trabajos para la revista", r"resúmenes para Cuadernos"]},
     {"name": "Cursos",                      "patterns": [r"Cursos de capacitación", r"Cursos"]},
 ]
-
 FACULTY_HDR = re.compile(r"^(Facultad|Instituto Superior|Vicerrectorado|Escuela)\b.*", re.IGNORECASE)
 ITEM_SPLIT  = re.compile(r"\n\s*(?:[\u2022•\-]|[\u25CF\u25A0\u25E6]|\d+\.)\s*")
 
@@ -78,8 +80,7 @@ def split_sections(text: str):
             if m.group(f"s{i}"):
                 hits.append((sec["name"], m.start()))
                 break
-    if not hits:
-        return [("General", 0, len(text))]
+    if not hits: return [("General", 0, len(text))]
     hits.sort(key=lambda x: x[1])
     spans = []
     for i, (name, start) in enumerate(hits):
@@ -176,72 +177,50 @@ def build_dataframe(text: str, source_name: str) -> pd.DataFrame:
         df = df[["Acta","Fecha","Facultad","Tipo_tema","Titulo_o_denominacion","Director","Estado","Destino_publicacion","Fuente_archivo"]]
     return df
 
-# ================== AUTH HELPERS ================== #
-def get_google_creds(scopes):
+# ================== GOOGLE HELPERS ================== #
+def get_creds(scopes):
     if not HAS_GOOGLE or "gcp_service_account" not in st.secrets:
         return None
     return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
 
-def upload_df_to_google_sheets(df: pd.DataFrame, sheet_name: str, ws_name: str):
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file",
-    ]
-    creds = get_google_creds(scopes)
-    if creds is None:
-        raise RuntimeError("No hay credenciales en st.secrets['gcp_service_account'].")
+def ensure_folder_access(folder_id: str, drive):
+    # No-op, asumimos que ya compartiste la carpeta con la Service Account.
+    return True
 
-    client = gspread.authorize(creds)
-    try:
-        sh = client.open(sheet_name)
-    except gspread.exceptions.SpreadsheetNotFound:
-        sh = client.create(sheet_name)
-    try:
-        ws = sh.worksheet(ws_name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=ws_name, rows=1000, cols=20)
-    ws.clear()
-    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
-    return sh.url
+def delete_existing_by_name_in_folder(drive, name: str, folder_id: str):
+    q = (
+        f"name = '{name.replace(\"'\",\"\\'\")}' and "
+        f"'{folder_id}' in parents and "
+        f"mimeType = 'application/vnd.google-apps/spreadsheet' and "
+        f"trashed = false"
+    )
+    res = drive.files().list(q=q, fields="files(id)").execute()
+    for f in res.get("files", []):
+        drive.files().delete(fileId=f["id"]).execute()
 
-def create_native_sheet_on_drive_from_df(df: pd.DataFrame, file_name: str, parent_folder_id: str | None = None):
-    """
-    Crea DIRECTAMENTE una Hoja de Cálculo de Google (nativa) en Drive,
-    convirtiendo un CSV en memoria (sin guardar archivo).
-    """
-    scopes = [
-        "https://www.googleapis.com/auth/drive.file",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = get_google_creds(scopes)
+def create_native_sheet_in_folder_from_df(df: pd.DataFrame, name: str, folder_id: str):
+    scopes = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
+    creds = get_creds(scopes)
     if creds is None:
-        raise RuntimeError("No hay credenciales en st.secrets['gcp_service_account'].")
+        raise RuntimeError("Faltan credenciales en st.secrets['gcp_service_account'].")
 
     drive = build("drive", "v3", credentials=creds)
 
-    # CSV en memoria
+    ensure_folder_access(folder_id, drive)
+    delete_existing_by_name_in_folder(drive, name, folder_id)
+
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     media = MediaIoBaseUpload(io.BytesIO(csv_bytes), mimetype="text/csv", resumable=False)
-
     metadata = {
-        "name": file_name,
-        "mimeType": "application/vnd.google-apps.spreadsheet"
+        "name": name,
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "parents": [folder_id],
     }
-    if parent_folder_id:
-        metadata["parents"] = [parent_folder_id]
-
     file = drive.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
     return file.get("webViewLink")
 
 # ================== UI ================== #
 file = st.file_uploader("Subí el acta (PDF o DOCX)", type=["pdf","docx"])
-col1, col2 = st.columns(2)
-with col1:
-    sheet_name = st.text_input("Nombre del Google Sheet (para subir con gspread)", value="Base Consejo de Investigación")
-with col2:
-    ws_name = st.text_input("Nombre de la pestaña (worksheet)", value="Actas")
-
-parent_id = st.text_input("ID de carpeta en Drive (opcional, para crear Sheet nativo)", value="", help="Pega aquí el ID de la carpeta de Drive donde querés crear la hoja nativa (opcional).")
 
 if file:
     suffix = file.name.split(".")[-1].lower()
@@ -259,49 +238,40 @@ if file:
     st.success("Extracción completada.")
     st.dataframe(df, use_container_width=True)
 
-    # -------- Descargar Excel (con fallback) -------- #
-    st.subheader("Descargar Excel / CSV")
+    # Descargas locales (opcional)
+    st.subheader("Descargar")
+    # Excel (fallback openpyxl/xlsxwriter)
     def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
         buf = io.BytesIO()
         try:
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Actas")
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                df.to_excel(w, index=False, sheet_name="Actas")
         except Exception:
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="Actas")
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+                df.to_excel(w, index=False, sheet_name="Actas")
         return buf.getvalue()
-
-    excel_bytes = df_to_excel_bytes(df)
-    st.download_button("💾 Descargar Excel (Actas.xlsx)", data=excel_bytes,
+    st.download_button("💾 Excel (Actas.xlsx)", data=df_to_excel_bytes(df),
                        file_name="Actas.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("⬇️ Descargar CSV (Actas.csv)", data=df.to_csv(index=False).encode("utf-8"),
+    st.download_button("⬇️ CSV (Actas.csv)", data=df.to_csv(index=False).encode("utf-8"),
                        file_name="Actas.csv", mime="text/csv")
 
-    # -------- Subir a Google Sheets (gspread) -------- #
-    st.subheader("Actualizar Google Sheets (con gspread)")
-    st.caption("Requiere `st.secrets['gcp_service_account']` con tu JSON de Service Account.")
-    can_google = HAS_GOOGLE and ("gcp_service_account" in st.secrets)
-    do_upload = st.checkbox("Subir/actualizar hoja (reemplaza el contenido)", value=False, disabled=not can_google)
-    if do_upload and can_google:
+    # === CREACIÓN AUTOMÁTICA EN DRIVE (sin clicks) ===
+    st.subheader("Creación automática en tu Drive")
+    if "gcp_service_account" not in st.secrets:
+        st.info("Cargá tu Service Account en *Settings → Secrets* con la clave: gcp_service_account. "
+                "También compartí la carpeta destino con esa cuenta (permiso Editor).")
+    else:
         try:
-            url = upload_df_to_google_sheets(df, sheet_name, ws_name)
-            st.success(f"✅ Hoja actualizada: {sheet_name} / {ws_name}")
-            st.write("Abrir:", url)
-        except Exception as e:
-            st.error(f"Error al actualizar Google Sheets: {e}")
-
-    # -------- Crear hoja nativa en Drive (conversión automática) -------- #
-    st.subheader("Crear **Hoja de Cálculo de Google** nativa en Drive (conversión automática)")
-    st.caption("Genera una hoja nativa en tu Drive desde este resultado, sin pasar por .xlsx. Opcionalmente indicá la carpeta destino.")
-    do_convert = st.checkbox("Crear hoja nativa en Drive (convierte desde CSV)", value=False, disabled=not can_google)
-    new_name = st.text_input("Nombre del archivo en Drive (nuevo)", value=f"Actas - {df['Acta'].iat[0] or 'Consejo'}")
-    if do_convert and can_google:
-        try:
-            link = create_native_sheet_on_drive_from_df(df, new_name, parent_id or None)
-            st.success("✅ Hoja de Cálculo creada en Drive (nativa).")
+            acta_num = df["Acta"].iloc[0] if (df["Acta"] != "").any() else ""
+            stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+            sheet_name = f"Actas Consejo {acta_num}".strip() if acta_num else f"Actas Consejo {stamp}"
+            link = create_native_sheet_in_folder_from_df(df, sheet_name, FOLDER_ID)
+            st.success(f"✅ Hoja creada/actualizada en tu carpeta *Actas de Consejo*: **{sheet_name}**")
             st.write("Abrir:", link)
-            st.caption("Conectá esta hoja a Looker Studio para sincronización directa.")
+            st.caption("Ya podés conectar esta hoja a Looker Studio.")
         except Exception as e:
-            st.error(f"Error al crear hoja nativa en Drive: {e}")
+            st.error(f"Ocurrió un problema creando la hoja en Drive: {e}")
+else:
+    st.caption("Subí un archivo para comenzar. Formatos admitidos: PDF y DOCX.")
