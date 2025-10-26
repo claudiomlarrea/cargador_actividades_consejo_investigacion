@@ -1,10 +1,26 @@
-streamlit
-pandas
-openpyxl
-python-docx
-pdfminer.six
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
-google-cloud-documentai
+# --- Framework principal ---
+streamlit==1.39.0
+
+# --- Manipulación de datos ---
+pandas==2.2.3
+numpy==1.26.4
+openpyxl==3.1.5
+
+# --- Procesamiento de textos y documentos ---
+python-docx==1.1.0
+pdfminer.six==20231228
+
+# --- Google Cloud / Document AI ---
+google-cloud-documentai==2.24.0
+google-cloud-core==2.4.1
+
+# --- Autenticación y APIs de Google ---
+google-api-python-client==2.155.0
+google-auth==2.34.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+
+# --- Utilidades ---
+httplib2==0.22.0
+requests==2.32.3
+protobuf==4.25.3
