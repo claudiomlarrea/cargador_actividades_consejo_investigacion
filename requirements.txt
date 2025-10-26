@@ -1,11 +1,9 @@
 streamlit
 pandas
-pdfminer.six
-python-docx
-google-api-python-client
-google-auth
-google-auth-httplib2
 openpyxl
+python-docx
+pdfminer.six
+google-cloud-documentai
 google-api-python-client
 google-auth
 google-auth-httplib2
