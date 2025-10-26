@@ -3,65 +3,63 @@ import streamlit as st
 import pandas as pd
 from google.cloud import documentai_v1 as documentai
 from google.oauth2 import service_account
-from openpyxl import Workbook
 
 # ==============================
-# CONFIGURACIÓN DEL PROYECTO
+# CONFIGURACIÓN DE GOOGLE CLOUD
 # ==============================
 PROJECT_ID = "extractor-de-texto-476314"
-LOCATION = "us"  # región donde creaste el procesador
-PROCESSOR_ID = "9d07fab065b8b880"  # ID de tu procesador Document AI
+LOCATION = "us"  # región elegida en Document AI
+PROCESSOR_ID = "9d0f7ab065b8b880"  # tu ID de procesador
 
-# Ruta del archivo JSON de credenciales (descargado de Google Cloud)
+# Ruta del archivo JSON con las credenciales del servicio
 CREDENTIALS_PATH = "client_secret_1050909706701-ilv4mom0r2do2dppsunif1ip6o428hcn.apps.googleusercontent.com.json"
 
 # ==============================
-# FUNCIÓN PRINCIPAL DE EXTRACCIÓN
+# FUNCIÓN DE EXTRACCIÓN DOCUMENT AI
 # ==============================
 def extract_text_with_document_ai(file_path):
-    """Extrae texto del PDF usando Google Document AI."""
+    """Procesa un PDF con Document AI y devuelve el texto completo."""
     credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
     client = documentai.DocumentProcessorServiceClient(credentials=credentials)
 
     name = f"projects/{PROJECT_ID}/locations/{LOCATION}/processors/{PROCESSOR_ID}"
-
     with open(file_path, "rb") as f:
         document = {"content": f.read(), "mime_type": "application/pdf"}
 
     request = {"name": name, "raw_document": document}
     result = client.process_document(request=request)
-
-    text = result.document.text
-    return text
+    return result.document.text
 
 # ==============================
-# FLUJO STREAMLIT
+# FUNCIÓN STREAMLIT PRINCIPAL
 # ==============================
 def main():
     st.title("📄 Extractor de Actas del Consejo de Investigación – UCCuyo")
-    st.write("Esta aplicación utiliza Google Document AI para extraer texto automáticamente de los archivos PDF de actas y generar una base institucional estructurada.")
+    st.caption("Usa inteligencia artificial (Document AI de Google Cloud) para leer y estructurar el contenido de las actas institucionales.")
 
-    uploaded_files = st.file_uploader("Subí uno o más archivos PDF", type=["pdf"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Subí tus actas en PDF", type=["pdf"], accept_multiple_files=True)
 
     if uploaded_files:
-        data = []
-        for uploaded_file in uploaded_files:
-            with open(uploaded_file.name, "wb") as f:
-                f.write(uploaded_file.read())
+        resultados = []
+        for file in uploaded_files:
+            # Guardar PDF temporal
+            pdf_path = file.name
+            with open(pdf_path, "wb") as f:
+                f.write(file.read())
 
-            st.write(f"Procesando **{uploaded_file.name}**...")
-            extracted_text = extract_text_with_document_ai(uploaded_file.name)
-            data.append({"Archivo": uploaded_file.name, "Texto extraído": extracted_text[:5000]})
+            st.info(f"Procesando **{pdf_path}** ...")
+            texto_extraido = extract_text_with_document_ai(pdf_path)
+            resultados.append({"Archivo": pdf_path, "Texto extraído": texto_extraido})
 
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(resultados)
         st.dataframe(df)
 
         # Exportar resultados a Excel
-        output_path = "resultados_actas.xlsx"
-        df.to_excel(output_path, index=False)
-        st.success("✅ Proceso completado. Podés descargar el archivo Excel:")
-        with open(output_path, "rb") as f:
-            st.download_button("Descargar resultados", f, file_name=output_path)
+        output = "actas_extraidas.xlsx"
+        df.to_excel(output, index=False)
+        with open(output, "rb") as f:
+            st.download_button("📥 Descargar resultados en Excel", f, file_name=output)
+        st.success("✅ Extracción completada con Document AI")
 
 if __name__ == "__main__":
     main()
