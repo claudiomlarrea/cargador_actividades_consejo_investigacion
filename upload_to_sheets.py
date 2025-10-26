@@ -1,98 +1,76 @@
 # upload_to_sheets.py
-from typing import List
-import os
+# --------------------------------------------------------
+# Sube un DataFrame a Google Sheets usando la cuenta
+# de servicio que pegaste en Streamlit Secrets.
+# --------------------------------------------------------
+
+import streamlit as st
 import pandas as pd
 
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.oauth2 import service_account
 
 
-# Ruta del JSON de la cuenta de servicio.
-# Si ya definiste la variable de entorno, la tomamos de ahí.
-SA_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
-
-
-def _get_sheets_service():
-    if not os.path.exists(SA_PATH):
-        raise FileNotFoundError(
-            f"No encuentro el JSON de la cuenta de servicio: {SA_PATH}\n"
-            "Colócalo en la raíz o define GOOGLE_APPLICATION_CREDENTIALS."
-        )
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = service_account.Credentials.from_service_account_file(SA_PATH, scopes=scopes)
-    return build("sheets", "v4", credentials=creds)
+def _get_gcp_credentials(scopes=None):
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"]
+    )
+    if scopes:
+        creds = creds.with_scopes(scopes)
+    return creds
 
 
 def _ensure_sheet_exists(service, spreadsheet_id: str, sheet_name: str):
-    """Crea la pestaña si no existe."""
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheets = meta.get("sheets", [])
-    titles = [s["properties"]["title"] for s in sheets]
-
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if sheet_name not in titles:
-        requests = [{
-            "addSheet": {
-                "properties": {"title": sheet_name}
-            }
-        }]
-        body = {"requests": requests}
         service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id, body=body
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
         ).execute()
 
 
-def _clear_sheet(service, spreadsheet_id: str, sheet_name: str):
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id, range=f"'{sheet_name}'!A:ZZ"
-    ).execute()
-
-
-def _df_to_values(df: pd.DataFrame) -> List[List[str]]:
-    values = [list(df.columns)]
-    for _, row in df.iterrows():
-        values.append([None if pd.isna(v) else str(v) for v in row.tolist()])
-    return values
-
-
-def upload_dataframe_to_sheet(spreadsheet_id: str, sheet_name: str, df: pd.DataFrame, *, overwrite: bool = True):
+def upload_dataframe_to_sheet(df: pd.DataFrame, spreadsheet_id: str = None, sheet_name: str = None) -> bool:
     """
-    Sube un DataFrame a Google Sheets.
-    - Crea la pestaña si no existe.
-    - Si overwrite=True, limpia el contenido antes de cargar.
-    - Escribe encabezados y filas.
+    Sube df al Google Sheet indicado.
+    Si no pasas IDs, toma los de [sheets] en secrets.
+    Requiere que hayas compartido el Sheet con la service account como Editor.
     """
     if df is None or df.empty:
-        raise ValueError("El DataFrame está vacío; no hay datos para subir.")
+        st.error("El DataFrame está vacío, no hay nada para subir.")
+        return False
 
-    service = _get_sheets_service()
-    _ensure_sheet_exists(service, spreadsheet_id, sheet_name)
+    if spreadsheet_id is None:
+        spreadsheet_id = st.secrets["sheets"]["spreadsheet_id"]
+    if sheet_name is None:
+        sheet_name = st.secrets["sheets"]["sheet_name"]
 
-    if overwrite:
-        _clear_sheet(service, spreadsheet_id, sheet_name)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = _get_gcp_credentials(scopes=scopes)
+    service = build("sheets", "v4", credentials=creds)
 
-    values = _df_to_values(df)
-    body = {"values": values}
-
-    # Escribimos desde A1
     try:
+        # Crea la pestaña si no existe
+        _ensure_sheet_exists(service, spreadsheet_id, sheet_name)
+
+        # Limpia contenido previo
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{sheet_name}'!A:ZZ"
+        ).execute()
+
+        # Escribe encabezados + filas
+        values = [list(df.columns)] + df.astype(str).values.tolist()
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=f"'{sheet_name}'!A1",
             valueInputOption="RAW",
-            body=body
+            body={"values": values},
         ).execute()
+
+        return True
+
     except HttpError as e:
-        raise RuntimeError(f"Error subiendo datos a Sheets: {e}")
-
-
-if __name__ == "__main__":
-    # Ejemplo rápido (solo para probar):
-    demo = pd.DataFrame({
-        "Etiqueta": ["Proyecto", "Director", "Fecha"],
-        "Valor": ["Comercio Justo...", "DIAZ BAY Javier", "19/11/2024"],
-        "Confianza": [0.97, 0.98, 0.99],
-    })
-    # Reemplaza por tu ID de Google Sheets y nombre de pestaña
-    upload_dataframe_to_sheet("TU_SPREADSHEET_ID", "Actas", demo)
-    print("OK subido.")
+        st.error(f"Error subiendo a Sheets: {e}")
+        return False
