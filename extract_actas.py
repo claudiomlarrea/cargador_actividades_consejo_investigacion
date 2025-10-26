@@ -1,65 +1,104 @@
-import os
+# extract_actas.py
+# --------------------------------------------------------
+# Funciones para procesar PDFs con Google Document AI
+# (usando credenciales desde Streamlit Secrets)
+# + fallback local para PDF/DOCX cuando haga falta.
+# --------------------------------------------------------
+
+import io
 import streamlit as st
 import pandas as pd
+
 from google.cloud import documentai_v1 as documentai
 from google.oauth2 import service_account
 
-# ==============================
-# CONFIGURACIÓN DE GOOGLE CLOUD
-# ==============================
-PROJECT_ID = "extractor-de-texto-476314"
-LOCATION = "us"  # región elegida en Document AI
-PROCESSOR_ID = "9d0f7ab065b8b880"  # tu ID de procesador
+from pdfminer.high_level import extract_text as pdf_extract_text
+from docx import Document as DocxDocument
 
-# Ruta del archivo JSON con las credenciales del servicio
-CREDENTIALS_PATH = "client_secret_1050909706701-ilv4mom0r2do2dppsunif1ip6o428hcn.apps.googleusercontent.com.json"
 
-# ==============================
-# FUNCIÓN DE EXTRACCIÓN DOCUMENT AI
-# ==============================
-def extract_text_with_document_ai(file_path):
-    """Procesa un PDF con Document AI y devuelve el texto completo."""
-    credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_PATH)
-    client = documentai.DocumentProcessorServiceClient(credentials=credentials)
+# ============= CREDENCIALES =============
+def get_gcp_credentials(scopes=None):
+    """
+    Carga credenciales desde Streamlit Secrets.
+    Debes haber pegado tu JSON en:
+      [gcp_service_account]
+      ...
+    """
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"]
+    )
+    if scopes:
+        creds = creds.with_scopes(scopes)
+    return creds
 
-    name = f"projects/{PROJECT_ID}/locations/{LOCATION}/processors/{PROCESSOR_ID}"
-    with open(file_path, "rb") as f:
-        document = {"content": f.read(), "mime_type": "application/pdf"}
 
-    request = {"name": name, "raw_document": document}
+# ============= DOCUMENT AI =============
+def process_with_document_ai(file_bytes: bytes, mime_type: str = "application/pdf"):
+    """
+    Procesa un archivo con tu Custom Extractor de Document AI.
+    Lee project/location/processor desde [docai] en secrets.
+    Devuelve: (texto_completo, dataframe_de_entidades)
+    """
+    project_id  = st.secrets["docai"]["project_id"]
+    location    = st.secrets["docai"]["location"]
+    processor_id= st.secrets["docai"]["processor_id"]
+
+    creds = get_gcp_credentials()
+    client = documentai.DocumentProcessorServiceClient(credentials=creds)
+    name = f"projects/{project_id}/locations/{location}/processors/{processor_id}"
+
+    raw_document = documentai.RawDocument(content=file_bytes, mime_type=mime_type)
+    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
     result = client.process_document(request=request)
-    return result.document.text
+    doc = result.document
 
-# ==============================
-# FUNCIÓN STREAMLIT PRINCIPAL
-# ==============================
-def main():
-    st.title("📄 Extractor de Actas del Consejo de Investigación – UCCuyo")
-    st.caption("Usa inteligencia artificial (Document AI de Google Cloud) para leer y estructurar el contenido de las actas institucionales.")
+    # Texto completo del documento
+    full_text = doc.text or ""
 
-    uploaded_files = st.file_uploader("Subí tus actas en PDF", type=["pdf"], accept_multiple_files=True)
+    # Entidades etiquetadas por tu Custom Extractor
+    rows = []
+    for e in doc.entities or []:
+        page = None
+        try:
+            if e.page_anchor and e.page_anchor.page_refs:
+                page = e.page_anchor.page_refs[0].page
+        except Exception:
+            page = None
 
-    if uploaded_files:
-        resultados = []
-        for file in uploaded_files:
-            # Guardar PDF temporal
-            pdf_path = file.name
-            with open(pdf_path, "wb") as f:
-                f.write(file.read())
+        rows.append({
+            "Etiqueta": e.type_,
+            "Valor": e.mention_text,
+            "Confianza": round(getattr(e, "confidence", 0.0), 3),
+            "Página": page,
+        })
 
-            st.info(f"Procesando **{pdf_path}** ...")
-            texto_extraido = extract_text_with_document_ai(pdf_path)
-            resultados.append({"Archivo": pdf_path, "Texto extraído": texto_extraido})
+    df_entities = pd.DataFrame(rows)
+    return full_text, df_entities
 
-        df = pd.DataFrame(resultados)
-        st.dataframe(df)
 
-        # Exportar resultados a Excel
-        output = "actas_extraidas.xlsx"
-        df.to_excel(output, index=False)
-        with open(output, "rb") as f:
-            st.download_button("📥 Descargar resultados en Excel", f, file_name=output)
-        st.success("✅ Extracción completada con Document AI")
+# ============= FALLBACK LOCAL =============
+def extract_text_local(uploaded_file):
+    """
+    Si Document AI no está disponible, extrae texto local:
+    - PDF con pdfminer.six
+    - DOCX con python-docx
+    - TXT como texto plano
+    """
+    name = uploaded_file.name.lower()
 
-if __name__ == "__main__":
-    main()
+    if name.endswith(".pdf"):
+        # pdfminer necesita un path o un buffer binario
+        data = uploaded_file.read()
+        buffer = io.BytesIO(data)
+        text = pdf_extract_text(buffer)
+        return text
+
+    if name.endswith(".docx"):
+        data = uploaded_file.read()
+        buffer = io.BytesIO(data)
+        doc = DocxDocument(buffer)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        return text
+
+    # Texto plano u otros
+    return uploaded_file.read().decode("utf-8", errors="ignore")
